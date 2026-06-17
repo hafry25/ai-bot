@@ -231,7 +231,7 @@ function validateRuntimeConfiguration() {
 }
 
 // ------------------------------
-//  Single Process Lock (with automatic stale lock cleanup)
+//  Single Process Lock
 // ------------------------------
 class ProcessLock {
   constructor(lockPath) {
@@ -273,31 +273,26 @@ class ProcessLock {
     }
   }
 
-  // Returns true if lock file was removed or does not exist, false if valid lock exists.
-  cleanupStaleLock() {
+  // Returns true if the lock does not exist, false if a valid lock exists.
+  assertLockCanBeAcquired() {
     try {
       const owner = this.readOwner();
       if (!this.processIsAlive(owner.pid)) {
-        console.warn(`[LOCK] Deleting stale lock ${this.lockPath} (PID ${owner.pid} is dead)`);
-        fs.unlinkSync(this.lockPath);
-        return true;
+        throw new Error(
+          `Stale bot lock found for PID ${owner.pid}. ` +
+          `Inspect ${this.lockPath} and remove it manually if no bot is running.`
+        );
       }
-      // lock is valid, still exists
       return false;
     } catch (err) {
-      if (err.code === 'ENOENT') return true; // doesn't exist
-      // corrupt or other error: delete it
-      console.warn(`[LOCK] Corrupt/invalid lock file: ${this.lockPath} - ${err.message}`);
-      try { fs.unlinkSync(this.lockPath); } catch (_) {}
-      return true;
+      if (err.code === 'ENOENT') return true;
+      throw err;
     }
   }
 
   acquire() {
-    // Clean up any stale lock
-    const lockRemoved = this.cleanupStaleLock();
-    if (!lockRemoved) {
-      // lock file exists and is valid
+    const lockMissing = this.assertLockCanBeAcquired();
+    if (!lockMissing) {
       const owner = this.readOwner();
       throw new Error(`Bot already running with PID ${owner.pid}. Lock: ${this.lockPath}`);
     }
@@ -322,29 +317,14 @@ class ProcessLock {
       return;
     } catch (err) {
       if (err.code !== 'EEXIST') throw err;
-      // Race condition: someone else created the lock just after our cleanup.
       const owner = this.readOwner();
       if (this.processIsAlive(owner.pid)) {
         throw new Error(`Bot already running with PID ${owner.pid}. Lock: ${this.lockPath}`);
-      } else {
-        // stale lock, delete and retry
-        fs.unlinkSync(this.lockPath);
-        this.fd = fs.openSync(this.lockPath, 'wx');
-        this.ownerToken = crypto.randomUUID();
-        fs.writeFileSync(this.fd, JSON.stringify({
-          pid: process.pid,
-          token: this.ownerToken,
-          acquiredAt: new Date().toISOString(),
-        }));
-        fs.fsyncSync(this.fd);
-        if (!this.ownsLock()) {
-          fs.closeSync(this.fd);
-          this.fd = null;
-          this.ownerToken = null;
-          throw new Error(`Lost bot lock during acquisition: ${this.lockPath}`);
-        }
-        console.log(`[LOCK] Acquired lock ${this.lockPath} for PID ${process.pid} (after retry)`);
       }
+      throw new Error(
+        `Stale bot lock found for PID ${owner.pid}. ` +
+        `Inspect ${this.lockPath} and remove it manually if no bot is running.`
+      );
     }
   }
 
@@ -746,12 +726,16 @@ class AIGridValidator {
     AIGridValidator.cache.set(key, { value, expiresAt: Date.now() + AI_VALIDATION_CACHE_TTL_MS });
   }
 
-  getLastDecision(symbol, allowStale = false) {
+  getLastDecisionEntry(symbol, allowStale = false) {
     const entry = AIGridValidator.lastDecisionBySymbol.get(symbol);
     if (!entry) return null;
     const age = Date.now() - entry.at;
-    if (allowStale || age < AI_VALIDATION_CACHE_TTL_MS) return entry.value;
+    if (allowStale || age < AI_VALIDATION_CACHE_TTL_MS) return entry;
     return null;
+  }
+
+  getLastDecision(symbol, allowStale = false) {
+    return this.getLastDecisionEntry(symbol, allowStale)?.value || null;
   }
 
   rememberDecision(symbol, decision) {
@@ -878,9 +862,9 @@ Be conservative. Protect capital first.
     const cached = this.getCached(cacheKey);
     if (cached) return cached;
 
-    const lastDecision = this.getLastDecision(symbol);
+    const lastDecision = this.getLastDecisionEntry(symbol);
     if (!ignoreMinInterval && lastDecision && Date.now() - lastDecision.at < AI_VALIDATION_MIN_INTERVAL_MS) {
-      return lastDecision;
+      return lastDecision.value;
     }
 
     if (AIGridValidator.rateLimitedUntil > Date.now()) {
