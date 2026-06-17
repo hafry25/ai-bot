@@ -277,14 +277,12 @@ class ProcessLock {
     try {
       const owner = this.readOwner();
       if (!this.processIsAlive(owner.pid)) {
-        console.warn(`[LOCK] Stale lock detected (PID ${owner.pid} is dead). Removing ${this.lockPath}`);
-        fs.unlinkSync(this.lockPath);
+        console.warn(`[LOCK] Stale lock detected (PID ${owner.pid} is dead). Leaving ${this.lockPath} in place`);
         return true;
       }
     } catch (err) {
       if (err.code !== 'ENOENT') {
-        console.warn(`[LOCK] Removing corrupt/invalid lock file: ${this.lockPath} - ${err.message}`);
-        try { fs.unlinkSync(this.lockPath); } catch(e) { /* ignore */ }
+        console.warn(`[LOCK] Corrupt/invalid lock file: ${this.lockPath} - ${err.message}`);
         return true;
       }
     }
@@ -312,10 +310,10 @@ class ProcessLock {
       return;
     } catch (err) {
       if (err.code !== 'EEXIST') throw err;
-      if (this.cleanupStaleLock()) {
-        return this.acquire();
-      }
       const owner = this.readOwner();
+      if (!this.processIsAlive(owner.pid)) {
+        throw new Error(`Stale bot lock found for PID ${owner.pid}. Lock: ${this.lockPath}`);
+      }
       throw new Error(`Bot already running with PID ${owner.pid}. Lock: ${this.lockPath}`);
     }
   }
@@ -815,6 +813,8 @@ DECISION FRAMEWORK:
    - Trailing Up Just Shifted: ${trailingUpJustShifted}
    - Trailing Down Just Shifted: ${trailingDownJustShifted}
    - Assess new market regime after shift
+   - Do not block solely because price is near the new upper bound
+   - Do not block solely because price is near the new lower bound
 
 Be conservative. Protect capital first.
 `;
@@ -903,16 +903,16 @@ Be conservative. Protect capital first.
         const queryResult = this.learningMemory.querySimilarWithFeatures(features);
         if (queryResult && queryResult.samples >= LEARNING_MEMORY_MIN_SAMPLES) {
           const successRatio = queryResult.ratio;
-          // factor = 0.5 + successRatio → 1.0 at 50% success (neutral)
+          // factor = 0.5 + successRatio -> 1.0 at 50% success (neutral)
           const factor = 0.5 + successRatio;
           const oldConfidence = decision.confidence;
           decision.confidence = Math.min(100, Math.max(0, decision.confidence * factor));
           const direction = factor > 1 ? 'boosted' : (factor < 1 ? 'reduced' : 'unchanged');
           const pctSuccess = (successRatio * 100).toFixed(0);
-          decision.reason += ` | Memory: ${pctSuccess}% similar success (${queryResult.samples} samples) → confidence ${oldConfidence.toFixed(1)} → ${decision.confidence.toFixed(1)} (${direction}, ×${factor.toFixed(2)})`;
+          decision.reason += ` | Memory: ${pctSuccess}% similar success (${queryResult.samples} samples) -> confidence ${oldConfidence.toFixed(1)} -> ${decision.confidence.toFixed(1)} (${direction}, x${factor.toFixed(2)})`;
           console.log(
             `[MEMORY] ${symbol} success ratio ${pctSuccess}% (${queryResult.samples} samples) ` +
-            `→ confidence ${oldConfidence.toFixed(1)} → ${decision.confidence.toFixed(1)} (factor=${factor.toFixed(2)})`
+            `-> confidence ${oldConfidence.toFixed(1)} -> ${decision.confidence.toFixed(1)} (factor=${factor.toFixed(2)})`
           );
         }
         this.learningMemory.recordDecision(symbol, context, decision, profit);
@@ -1015,11 +1015,15 @@ class SpotGridEngine {
   }
 
   getTrailingUpState(symbol) {
-    return this.state.getSymbol(symbol).trailingUp;
+    const symState = this.state.getSymbol(symbol);
+    if (!symState.trailingUp) symState.trailingUp = { shifts: 0, lastShiftAt: null };
+    return symState.trailingUp;
   }
 
   getTrailingDownState(symbol) {
-    return this.state.getSymbol(symbol).trailingDown;
+    const symState = this.state.getSymbol(symbol);
+    if (!symState.trailingDown) symState.trailingDown = { shifts: 0, lastShiftAt: null };
+    return symState.trailingDown;
   }
 
   calculateTrailingShift(currentPrice, lower, upper, direction) {
@@ -1027,7 +1031,7 @@ class SpotGridEngine {
       const ratio = Math.pow(upper / lower, 1 / GRID_COUNT);
       if (!(ratio > 1)) return null;
       if (direction === 'up') {
-        if (currentPrice < upper * ratio) return null;
+        if (currentPrice < this.getTrailingUpTrigger(lower, upper)) return null;
         const steps = Math.max(1, Math.floor(Math.log(currentPrice / upper) / Math.log(ratio)));
         return {
           steps,
@@ -1035,7 +1039,7 @@ class SpotGridEngine {
           upper: upper * Math.pow(ratio, steps),
         };
       }
-      if (currentPrice > lower / ratio) return null;
+      if (currentPrice > this.getTrailingDownTrigger(lower, upper)) return null;
       const steps = Math.max(1, Math.floor(Math.log(lower / currentPrice) / Math.log(ratio)));
       return {
         steps,
@@ -1046,7 +1050,7 @@ class SpotGridEngine {
     const stepSize = (upper - lower) / GRID_COUNT;
     if (!(stepSize > 0)) return null;
     if (direction === 'up') {
-      if (currentPrice < upper + stepSize) return null;
+      if (currentPrice < this.getTrailingUpTrigger(lower, upper)) return null;
       const steps = Math.max(1, Math.floor((currentPrice - upper) / stepSize));
       return {
         steps,
@@ -1054,13 +1058,48 @@ class SpotGridEngine {
         upper: upper + stepSize * steps,
       };
     }
-    if (currentPrice > lower - stepSize) return null;
+    if (currentPrice > this.getTrailingDownTrigger(lower, upper)) return null;
     const steps = Math.max(1, Math.floor((lower - currentPrice) / stepSize));
     return {
       steps,
       lower: lower - stepSize * steps,
       upper: upper - stepSize * steps,
     };
+  }
+
+  getTrailingUpTrigger(lower, upper) {
+    if (GRID_MODE === 'GEOMETRIC') {
+      const ratio = Math.pow(upper / lower, 1 / GRID_COUNT);
+      return upper * ratio;
+    }
+    return upper + ((upper - lower) / GRID_COUNT);
+  }
+
+  getTrailingDownTrigger(lower, upper) {
+    if (GRID_MODE === 'GEOMETRIC') {
+      const ratio = Math.pow(upper / lower, 1 / GRID_COUNT);
+      return lower / ratio;
+    }
+    return lower - ((upper - lower) / GRID_COUNT);
+  }
+
+  shiftStoredLevelIndexes(symbol, offset) {
+    const symState = this.state.getSymbol(symbol);
+
+    const shiftedOrders = {};
+    for (const [orderId, order] of Object.entries(symState.orders)) {
+      shiftedOrders[orderId] = {
+        ...order,
+        levelIndex: Number(order.levelIndex) + offset,
+      };
+    }
+    symState.orders = shiftedOrders;
+
+    const shiftedBuys = {};
+    for (const [levelIndex, buy] of Object.entries(symState.lastBuyByLevel)) {
+      shiftedBuys[Number(levelIndex) + offset] = buy;
+    }
+    symState.lastBuyByLevel = shiftedBuys;
   }
 
   async applyTrailingRangeShift(symbol, lower, upper, shift, direction) {
@@ -1072,12 +1111,10 @@ class SpotGridEngine {
     symState.config.lower = shift.lower;
     symState.config.upper = shift.upper;
     const offset = direction === 'up' ? -shift.steps : shift.steps;
-    const shiftedBuys = {};
-    for (const [idx, buy] of Object.entries(symState.lastBuyByLevel)) {
-      shiftedBuys[Number(idx) + offset] = buy;
-    }
+    this.shiftStoredLevelIndexes(symbol, offset);
+
     const cleanedBuys = {};
-    for (const [idx, buy] of Object.entries(shiftedBuys)) {
+    for (const [idx, buy] of Object.entries(symState.lastBuyByLevel)) {
       const newIdx = Number(idx);
       if (newIdx >= 0 && newIdx <= GRID_COUNT) cleanedBuys[newIdx] = buy;
       else console.warn(`[TRAILING] Dropping buy at level ${idx} (out of new range after ${direction} shift)`);
@@ -1097,7 +1134,7 @@ class SpotGridEngine {
       `[GRID TRAILING ${direction.toUpperCase()}] ${symbol} shifted ${shift.steps} grid(s) to ` +
       `${roundNumber(shift.lower)}-${roundNumber(shift.upper)}`
     );
-    
+
     return { lower: shift.lower, upper: shift.upper };
   }
 
@@ -1199,6 +1236,7 @@ class SpotGridEngine {
   }
 
   async cancelGridOrders(symbol, reason) {
+    if (!this.exchange?.fetchOpenOrders || !this.exchange?.cancelOrder) return;
     const openOrders = await retry(() => this.exchange.fetchOpenOrders(symbol));
     const managed = this.getManagedOpenOrders(symbol, openOrders);
     for (const order of managed) {
@@ -1209,6 +1247,7 @@ class SpotGridEngine {
   }
 
   async cancelOrder(symbol, order, reason) {
+    if (!this.exchange?.cancelOrder) return;
     await retry(() => this.exchange.cancelOrder(order.id, symbol));
     this.state.forgetOrder(symbol, order.id);
     console.log(`[CANCEL] ${symbol} ${order.side} ${order.id} | ${reason}`);
@@ -1547,8 +1586,8 @@ class SpotGridEngine {
     let release;
     const current = new Promise(resolve => { release = resolve; });
     this.symbolLocks.set(symbol, current);
-    await previous;
     try {
+      await previous;
       return await fn();
     } finally {
       release();
