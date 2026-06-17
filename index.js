@@ -50,7 +50,7 @@ class Config {
 const SYMBOLS = Config.list('SYMBOLS', 'BTC/USDT');
 const EXCHANGE_MODE = (() => {
   const mode = Config.get('EXCHANGE_MODE', Config.boolean('EXCHANGE_DEMO', false) ? 'testnet' : 'live').toLowerCase();
-  if (mode === 'demo') return 'testnet';   // map demo → testnet
+  if (mode === 'demo') return 'testnet';
   return mode;
 })();
 const VALID_EXCHANGE_MODES = new Set(['live', 'testnet']);
@@ -79,12 +79,11 @@ const GRID_MAX_ACTIVE_SELL_ORDERS = Config.number('GRID_MAX_ACTIVE_SELL_ORDERS',
 const GRID_RECREATE_ON_START = Config.boolean('GRID_RECREATE_ON_START', false);
 const GRID_CANCEL_OUT_OF_RANGE = Config.boolean('GRID_CANCEL_OUT_OF_RANGE', true);
 const GRID_REFILL_ON_FILLED = Config.boolean('GRID_REFILL_ON_FILLED', true);
-const GRID_MIN_PROFIT_PCT = Config.number('GRID_MIN_PROFIT_PCT', 0.4) / 100;
 const GRID_STATE_FILE = Config.get('GRID_STATE_FILE', 'grid-state-spot.json');
 const GRID_STATE_PATH = path.resolve(process.cwd(), GRID_STATE_FILE);
 const BOT_LOCK_FILE = Config.get('BOT_LOCK_FILE', `${GRID_STATE_FILE}.lock`);
 const BOT_LOCK_PATH = path.resolve(process.cwd(), BOT_LOCK_FILE);
-const GRID_POST_ONLY = Config.boolean('GRID_POST_ONLY', true); // NEW: maker orders only
+const GRID_POST_ONLY = Config.boolean('GRID_POST_ONLY', true);
 
 const AI_VALIDATION_ENABLED = Config.boolean('AI_VALIDATION_ENABLED', false);
 const AI_VALIDATION_TIMEFRAME = Config.get('AI_VALIDATION_TIMEFRAME', '15m');
@@ -95,7 +94,6 @@ const AI_VALIDATION_BACKOFF_MS = Config.number('AI_VALIDATION_BACKOFF_MS', 10 * 
 const AI_VALIDATION_PRICE_BUCKET_PCT = Config.number('AI_VALIDATION_PRICE_BUCKET_PCT', 0.25);
 const AI_VALIDATION_RETRIES = Config.number('AI_VALIDATION_RETRIES', 2);
 const AI_MIN_CONFIDENCE = Config.number('AI_MIN_CONFIDENCE', 70);
-const AI_STRONG_CONFIDENCE = Config.number('AI_STRONG_CONFIDENCE', 85);
 const GEMINI_MODEL = Config.get('GEMINI_MODEL', 'gemini-2.0-flash-lite');
 
 const STOP_LOSS_PRICE = Config.number('GRID_STOP_LOSS_PRICE', 0);
@@ -111,6 +109,16 @@ const FONNTE_TARGET = Config.get('FONNTE_TARGET', '');
 const FONNTE_API_URL = Config.get('FONNTE_API_URL', 'https://api.fonnte.com/send');
 const FONNTE_COUNTRY_CODE = Config.get('FONNTE_COUNTRY_CODE', '62');
 const FONNTE_TIMEOUT_MS = Config.number('FONNTE_TIMEOUT_MS', 10_000);
+
+// ---- Learning Memory Configuration ----
+const LEARNING_MEMORY_ENABLED = Config.boolean('LEARNING_MEMORY_ENABLED', false);
+const LEARNING_MEMORY_FILE = Config.get('LEARNING_MEMORY_FILE', 'learning-memory.json');
+const LEARNING_MEMORY_PATH = path.resolve(process.cwd(), LEARNING_MEMORY_FILE);
+const LEARNING_MEMORY_LOOKBACK = Config.number('LEARNING_MEMORY_LOOKBACK', 20);
+const LEARNING_MEMORY_MIN_SAMPLES = Config.number('LEARNING_MEMORY_MIN_SAMPLES', 5);
+const LEARNING_MEMORY_OUTCOME_DELAY_MS = Config.number('LEARNING_MEMORY_OUTCOME_DELAY_MS', 10 * MINUTE_MS);
+const LEARNING_MEMORY_PROFIT_THRESHOLD = Config.number('LEARNING_MEMORY_PROFIT_THRESHOLD', 0.5);
+// ---------------------------------------
 
 const MAX_PROCESSED_TRADE_IDS = 2000;
 const TRADE_FETCH_LIMIT = 100;
@@ -195,7 +203,6 @@ function validateRuntimeConfiguration() {
   );
   requireInteger('GRID_MAX_ACTIVE_BUY_ORDERS', GRID_MAX_ACTIVE_BUY_ORDERS);
   requireInteger('GRID_MAX_ACTIVE_SELL_ORDERS', GRID_MAX_ACTIVE_SELL_ORDERS);
-  requireNonNegative('GRID_MIN_PROFIT_PCT', GRID_MIN_PROFIT_PCT);
   requireInteger('AI_VALIDATION_RETRIES', AI_VALIDATION_RETRIES);
   requirePositive('FONNTE_TIMEOUT_MS', FONNTE_TIMEOUT_MS);
 
@@ -224,7 +231,7 @@ function validateRuntimeConfiguration() {
 }
 
 // ------------------------------
-//  Single Process Lock
+//  Single Process Lock (with automatic stale lock cleanup)
 // ------------------------------
 class ProcessLock {
   constructor(lockPath) {
@@ -266,7 +273,26 @@ class ProcessLock {
     }
   }
 
+  cleanupStaleLock() {
+    try {
+      const owner = this.readOwner();
+      if (!this.processIsAlive(owner.pid)) {
+        console.warn(`[LOCK] Stale lock detected (PID ${owner.pid} is dead). Removing ${this.lockPath}`);
+        fs.unlinkSync(this.lockPath);
+        return true;
+      }
+    } catch (err) {
+      if (err.code !== 'ENOENT') {
+        console.warn(`[LOCK] Removing corrupt/invalid lock file: ${this.lockPath} - ${err.message}`);
+        try { fs.unlinkSync(this.lockPath); } catch(e) { /* ignore */ }
+        return true;
+      }
+    }
+    return false;
+  }
+
   acquire() {
+    this.cleanupStaleLock();
     try {
       this.fd = fs.openSync(this.lockPath, 'wx');
       this.ownerToken = crypto.randomUUID();
@@ -282,17 +308,15 @@ class ProcessLock {
         this.ownerToken = null;
         throw new Error(`Lost bot lock during acquisition: ${this.lockPath}`);
       }
+      console.log(`[LOCK] Acquired lock ${this.lockPath} for PID ${process.pid}`);
       return;
     } catch (err) {
       if (err.code !== 'EEXIST') throw err;
-      const owner = this.readOwner();
-      if (this.processIsAlive(owner.pid)) {
-        throw new Error(`Bot already running with PID ${owner.pid}. Lock: ${this.lockPath}`);
+      if (this.cleanupStaleLock()) {
+        return this.acquire();
       }
-      throw new Error(
-        `Stale bot lock found for PID ${owner.pid || 'unknown'}. ` +
-        `Verify no bot is running, then remove: ${this.lockPath}`
-      );
+      const owner = this.readOwner();
+      throw new Error(`Bot already running with PID ${owner.pid}. Lock: ${this.lockPath}`);
     }
   }
 
@@ -302,6 +326,7 @@ class ProcessLock {
       fs.closeSync(this.fd);
       if (this.ownsLock()) {
         fs.unlinkSync(this.lockPath);
+        console.log(`[LOCK] Released lock ${this.lockPath}`);
       } else {
         console.warn('[LOCK] Not releasing a lock with a different ownership token');
       }
@@ -405,6 +430,8 @@ class GridState {
         lastBuyByLevel: {},
         realizedGridProfit: 0,
         lastTradeTimestamp: 0,
+        trailingUp: { shifts: 0, lastShiftAt: null },
+        trailingDown: { shifts: 0, lastShiftAt: null },
       };
     }
     const sym = this.data.symbols[symbol];
@@ -413,6 +440,8 @@ class GridState {
     sym.lastBuyByLevel = isPlainObject(sym.lastBuyByLevel) ? sym.lastBuyByLevel : {};
     sym.realizedGridProfit = numberOrZero(sym.realizedGridProfit);
     sym.lastTradeTimestamp = numberOrZero(sym.lastTradeTimestamp);
+    if (!sym.trailingUp) sym.trailingUp = { shifts: 0, lastShiftAt: null };
+    if (!sym.trailingDown) sym.trailingDown = { shifts: 0, lastShiftAt: null };
     return sym;
   }
 
@@ -453,10 +482,158 @@ class GridState {
 }
 
 // ------------------------------
+//  Learning Memory
+// ------------------------------
+class LearningMemory {
+  constructor() {
+    this.records = [];
+    this.filePath = LEARNING_MEMORY_PATH;
+    if (LEARNING_MEMORY_ENABLED) {
+      this.load();
+    }
+  }
+
+  load() {
+    try {
+      if (fs.existsSync(this.filePath)) {
+        const raw = fs.readFileSync(this.filePath, 'utf8');
+        this.records = JSON.parse(raw);
+        console.log(`[MEMORY] Loaded ${this.records.length} decision records.`);
+      }
+    } catch (err) {
+      console.warn('[MEMORY] Failed to load memory file, starting fresh:', err.message);
+      this.records = [];
+    }
+  }
+
+  save() {
+    if (!LEARNING_MEMORY_ENABLED) return;
+    const temp = `${this.filePath}.tmp`;
+    fs.writeFileSync(temp, JSON.stringify(this.records, null, 2));
+    fs.renameSync(temp, this.filePath);
+  }
+
+  recordDecision(symbol, context, decision, profit = null) {
+    if (!LEARNING_MEMORY_ENABLED) return;
+    const record = {
+      symbol,
+      timestamp: Date.now(),
+      context: this.extractFeatures(context),
+      decision: {
+        allowTrading: decision.allowTrading,
+        allowBuy: decision.allowBuy,
+        allowSell: decision.allowSell,
+        confidence: decision.confidence,
+        reason: decision.reason,
+      },
+      profitAtDecision: profit,
+      outcome: null,
+    };
+    this.records.push(record);
+    if (this.records.length > 2000) {
+      this.records = this.records.slice(-2000);
+    }
+    this.save();
+  }
+
+  extractFeatures(context) {
+    const {
+      currentPrice, lower, upper, levels,
+      trailingUpJustShifted, trailingDownJustShifted
+    } = context;
+    const mid = (lower + upper) / 2;
+    const rangePct = ((upper - lower) / mid) * 100;
+    const distLower = ((currentPrice - lower) / currentPrice) * 100;
+    const distUpper = ((upper - currentPrice) / currentPrice) * 100;
+    return {
+      currentPrice,
+      rangePct: rangePct || 0,
+      distLower: distLower || 0,
+      distUpper: distUpper || 0,
+      trailingUp: trailingUpJustShifted ? 1 : 0,
+      trailingDown: trailingDownJustShifted ? 1 : 0,
+      changePct: 0,
+      volumeRatio: 0,
+    };
+  }
+
+  enrichContextFeatures(features, candleSummary) {
+    features.changePct = candleSummary.changePct || 0;
+    features.volumeRatio = candleSummary.volumeRatio || 0;
+    return features;
+  }
+
+  similarity(f1, f2) {
+    const norm = (val, min, max) => (val - min) / (max - min);
+    const features = [
+      { a: f1.rangePct, b: f2.rangePct, min: 0, max: 20 },
+      { a: f1.distLower, b: f2.distLower, min: -20, max: 20 },
+      { a: f1.distUpper, b: f2.distUpper, min: -20, max: 20 },
+      { a: f1.changePct, b: f2.changePct, min: -20, max: 20 },
+      { a: f1.volumeRatio, b: f2.volumeRatio, min: 0, max: 10 },
+      { a: f1.trailingUp, b: f2.trailingUp, min: 0, max: 1 },
+      { a: f1.trailingDown, b: f2.trailingDown, min: 0, max: 1 },
+    ];
+    let sumSq = 0;
+    for (const f of features) {
+      const na = (f.a - f.min) / (f.max - f.min);
+      const nb = (f.b - f.min) / (f.max - f.min);
+      sumSq += (na - nb) ** 2;
+    }
+    return Math.sqrt(sumSq / features.length);
+  }
+
+  querySimilarWithFeatures(features) {
+    if (!LEARNING_MEMORY_ENABLED) return null;
+    const now = Date.now();
+    const candidates = this.records.filter(r =>
+      r.symbol === features.symbol &&
+      r.outcome !== null &&
+      (now - r.timestamp) > LEARNING_MEMORY_OUTCOME_DELAY_MS
+    );
+    if (candidates.length < LEARNING_MEMORY_MIN_SAMPLES) return null;
+
+    const scored = candidates.map(r => ({
+      ...r,
+      dist: this.similarity(features, r.context),
+    }));
+    scored.sort((a, b) => a.dist - b.dist);
+    const top = scored.slice(0, LEARNING_MEMORY_LOOKBACK);
+    const successes = top.filter(r => r.outcome === 'success').length;
+    const ratio = successes / top.length;
+    return { ratio, samples: top.length };
+  }
+
+  updateOutcomes(symbol, currentProfit) {
+    if (!LEARNING_MEMORY_ENABLED) return;
+    const now = Date.now();
+    let updated = false;
+    for (const record of this.records) {
+      if (record.symbol !== symbol) continue;
+      if (record.outcome !== null) continue;
+      if (now - record.timestamp < LEARNING_MEMORY_OUTCOME_DELAY_MS) continue;
+      if (record.profitAtDecision === null) continue;
+      const profitChange = currentProfit - record.profitAtDecision;
+      record.outcome = profitChange > LEARNING_MEMORY_PROFIT_THRESHOLD ? 'success' : 'failure';
+      updated = true;
+    }
+    if (updated) this.save();
+  }
+
+  enrichContext(context, candleSummary) {
+    const features = this.extractFeatures(context);
+    features.symbol = context.symbol || 'unknown';
+    this.enrichContextFeatures(features, candleSummary);
+    return features;
+  }
+}
+
+// ------------------------------
 //  Gemini Grid Validation
 // ------------------------------
 class AIGridValidator {
   static cache = new Map();
+  static MAX_CACHE_SIZE = 100;
   static lastDecisionBySymbol = new Map();
   static rateLimitedUntil = 0;
 
@@ -469,6 +646,11 @@ class AIGridValidator {
       }
       const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
       this.model = genAI.getGenerativeModel({ model: GEMINI_MODEL });
+    }
+    if (LEARNING_MEMORY_ENABLED) {
+      this.learningMemory = new LearningMemory();
+    } else {
+      this.learningMemory = null;
     }
   }
 
@@ -493,7 +675,7 @@ class AIGridValidator {
       decision.allowTrading = false;
       decision.allowBuy = false;
       decision.allowSell = false;
-      decision.reason = `Auto-blocked: confidence too low (${conf}%) - extreme uncertainty`;
+      decision.reason = `Auto-blocked: confidence too low (${conf.toFixed(1)}%) - extreme uncertainty`;
     } else if (conf < 70) {
       if (!decision.allowTrading) decision.allowBuy = decision.allowSell = false;
     }
@@ -510,9 +692,10 @@ class AIGridValidator {
   priceBucket(currentPrice, levels) {
     const lower = Number(levels[0]);
     const upper = Number(levels[levels.length - 1]);
-    const gridStepPct = lower > 0 && levels.length > 1
-      ? Math.abs((Number(levels[1]) - lower) / lower) * 100
-      : AI_VALIDATION_PRICE_BUCKET_PCT;
+    let gridStepPct = AI_VALIDATION_PRICE_BUCKET_PCT;
+    if (lower > 0 && levels.length > 1) {
+      gridStepPct = Math.abs((Number(levels[1]) - lower) / lower) * 100;
+    }
     const bucketPct = Math.max(AI_VALIDATION_PRICE_BUCKET_PCT, gridStepPct / 2, 0.01);
     const bucketSize = currentPrice * (bucketPct / 100);
     const bucketedPrice = bucketSize > 0 ? Math.round(currentPrice / bucketSize) * bucketSize : currentPrice;
@@ -528,6 +711,10 @@ class AIGridValidator {
   }
 
   setCached(key, value) {
+    if (AIGridValidator.cache.size >= AIGridValidator.MAX_CACHE_SIZE) {
+      const oldest = AIGridValidator.cache.keys().next().value;
+      AIGridValidator.cache.delete(oldest);
+    }
     AIGridValidator.cache.set(key, { value, expiresAt: Date.now() + AI_VALIDATION_CACHE_TTL_MS });
   }
 
@@ -574,6 +761,7 @@ class AIGridValidator {
       rangePct: roundNumber(((high - low) / last) * 100, 4),
       avgVolume: roundNumber(avgVolume, 4),
       recentVolume: roundNumber(recentVolume, 4),
+      volumeRatio: avgVolume > 0 ? recentVolume / avgVolume : 1,
     };
   }
 
@@ -652,7 +840,7 @@ Be conservative. Protect capital first.
     };
   }
 
-  async validate(symbol, context, options = {}) {
+  async validate(symbol, context, options = {}, profit = null) {
     if (!AI_VALIDATION_ENABLED) return AIGridValidator.allow();
 
     const { ignoreMinInterval = false } = options;
@@ -676,23 +864,26 @@ Be conservative. Protect capital first.
         () => this.exchange.fetchOHLCV(symbol, AI_VALIDATION_TIMEFRAME, undefined, AI_VALIDATION_LOOKBACK),
         Math.max(AI_VALIDATION_RETRIES, 1)
       );
-      const prompt = this.buildPrompt(symbol, context, this.summarizeCandles(ohlcv));
+      const candleSummary = this.summarizeCandles(ohlcv);
+      const prompt = this.buildPrompt(symbol, context, candleSummary);
+      let decision;
       for (let attempt = 1; attempt <= AI_VALIDATION_RETRIES + 1; attempt++) {
         try {
           const result = await this.model.generateContent(prompt);
-          const decision = this.parseResponse(result.response.text());
+          decision = this.parseResponse(result.response.text());
           this.applyConfidenceRules(decision);
           if (decision.confidence < AI_MIN_CONFIDENCE) {
-            return this.blockAndRemember(
+            decision = this.blockAndRemember(
               symbol,
               cacheKey,
               `Low AI confidence: ${decision.reason}`,
               decision.confidence
             );
+          } else {
+            this.setCached(cacheKey, decision);
+            this.rememberDecision(symbol, decision);
           }
-          this.setCached(cacheKey, decision);
-          this.rememberDecision(symbol, decision);
-          return decision;
+          break;
         } catch (err) {
           if (this.isRateLimitError(err)) {
             AIGridValidator.rateLimitedUntil = Date.now() + AI_VALIDATION_BACKOFF_MS;
@@ -704,6 +895,31 @@ Be conservative. Protect capital first.
           await sleep(1000 * attempt);
         }
       }
+
+      // ---- Learning Memory Integration ----
+      if (this.learningMemory && decision) {
+        const features = this.learningMemory.enrichContext(context, candleSummary);
+        features.symbol = symbol;
+        const queryResult = this.learningMemory.querySimilarWithFeatures(features);
+        if (queryResult && queryResult.samples >= LEARNING_MEMORY_MIN_SAMPLES) {
+          const successRatio = queryResult.ratio;
+          // factor = 0.5 + successRatio → 1.0 at 50% success (neutral)
+          const factor = 0.5 + successRatio;
+          const oldConfidence = decision.confidence;
+          decision.confidence = Math.min(100, Math.max(0, decision.confidence * factor));
+          const direction = factor > 1 ? 'boosted' : (factor < 1 ? 'reduced' : 'unchanged');
+          const pctSuccess = (successRatio * 100).toFixed(0);
+          decision.reason += ` | Memory: ${pctSuccess}% similar success (${queryResult.samples} samples) → confidence ${oldConfidence.toFixed(1)} → ${decision.confidence.toFixed(1)} (${direction}, ×${factor.toFixed(2)})`;
+          console.log(
+            `[MEMORY] ${symbol} success ratio ${pctSuccess}% (${queryResult.samples} samples) ` +
+            `→ confidence ${oldConfidence.toFixed(1)} → ${decision.confidence.toFixed(1)} (factor=${factor.toFixed(2)})`
+          );
+        }
+        this.learningMemory.recordDecision(symbol, context, decision, profit);
+      }
+      // ------------------------------------
+
+      return decision;
     } catch (err) {
       const reason = this.isRateLimitError(err)
         ? `AI validation rate-limited; paused Gemini calls for ${Math.round(AI_VALIDATION_BACKOFF_MS / MINUTE_MS)}m`
@@ -713,7 +929,6 @@ Be conservative. Protect capital first.
       }
       return this.blockAndRemember(symbol, cacheKey, reason);
     }
-    return AIGridValidator.block('AI validation unavailable');
   }
 }
 
@@ -800,19 +1015,11 @@ class SpotGridEngine {
   }
 
   getTrailingUpState(symbol) {
-    const symState = this.state.getSymbol(symbol);
-    if (!symState.trailingUp) {
-      symState.trailingUp = { shifts: 0, lastShiftAt: null };
-    }
-    return symState.trailingUp;
+    return this.state.getSymbol(symbol).trailingUp;
   }
 
   getTrailingDownState(symbol) {
-    const symState = this.state.getSymbol(symbol);
-    if (!symState.trailingDown) {
-      symState.trailingDown = { shifts: 0, lastShiftAt: null };
-    }
-    return symState.trailingDown;
+    return this.state.getSymbol(symbol).trailingDown;
   }
 
   calculateTrailingShift(currentPrice, lower, upper, direction) {
@@ -869,7 +1076,13 @@ class SpotGridEngine {
     for (const [idx, buy] of Object.entries(symState.lastBuyByLevel)) {
       shiftedBuys[Number(idx) + offset] = buy;
     }
-    symState.lastBuyByLevel = shiftedBuys;
+    const cleanedBuys = {};
+    for (const [idx, buy] of Object.entries(shiftedBuys)) {
+      const newIdx = Number(idx);
+      if (newIdx >= 0 && newIdx <= GRID_COUNT) cleanedBuys[newIdx] = buy;
+      else console.warn(`[TRAILING] Dropping buy at level ${idx} (out of new range after ${direction} shift)`);
+    }
+    symState.lastBuyByLevel = cleanedBuys;
     trailingState.shifts += shift.steps;
     trailingState.lastShiftAt = new Date().toISOString();
     this.state.save();
@@ -884,6 +1097,7 @@ class SpotGridEngine {
       `[GRID TRAILING ${direction.toUpperCase()}] ${symbol} shifted ${shift.steps} grid(s) to ` +
       `${roundNumber(shift.lower)}-${roundNumber(shift.upper)}`
     );
+    
     return { lower: shift.lower, upper: shift.upper };
   }
 
@@ -1000,6 +1214,36 @@ class SpotGridEngine {
     console.log(`[CANCEL] ${symbol} ${order.side} ${order.id} | ${reason}`);
   }
 
+  async createOrderWithFallback(symbol, side, amount, price, levelIndex) {
+    const clientOrderId = this.makeClientOrderId(symbol, side, levelIndex);
+    const orderParams = { newClientOrderId: clientOrderId };
+    if (GRID_POST_ONLY) {
+      orderParams.postOnly = true;
+    }
+    try {
+      return await this.exchange.createLimitOrder(
+        symbol,
+        side,
+        amount,
+        price,
+        orderParams
+      );
+    } catch (err) {
+      if (GRID_POST_ONLY && err.message && err.message.includes('Post only order rejected')) {
+        console.warn(`[POST-ONLY] ${symbol} ${side} level=${levelIndex} retrying without post-only flag`);
+        delete orderParams.postOnly;
+        return await this.exchange.createLimitOrder(
+          symbol,
+          side,
+          amount,
+          price,
+          orderParams
+        );
+      }
+      throw err;
+    }
+  }
+
   async placeLimit(symbol, side, levelIndex, price, amount) {
     const pendingKey = `${symbol}|${side}|${levelIndex}`;
     if (this.pendingOrderLevels.has(pendingKey)) {
@@ -1008,14 +1252,11 @@ class SpotGridEngine {
     }
 
     this.pendingOrderLevels.add(pendingKey);
-    const clientOrderId = this.makeClientOrderId(symbol, side, levelIndex);
-    let precisePrice = null;
-    let preciseAmount = null;
     try {
-      precisePrice = this.exchange.priceToPrecision(symbol, price);
-      preciseAmount = this.exchange.amountToPrecision(symbol, amount);
-      const preciseNum = Number(precisePrice);
+      const precisePrice = this.exchange.priceToPrecision(symbol, price);
+      const preciseAmount = this.exchange.amountToPrecision(symbol, amount);
       const priceNum = Number(price);
+      const preciseNum = Number(precisePrice);
       const priceDiffPct = Math.abs(preciseNum - priceNum) / priceNum * 100;
       if (priceDiffPct > 0.5) {
         console.warn(
@@ -1024,43 +1265,24 @@ class SpotGridEngine {
         return null;
       }
 
-      // === VALIDASI MIN NOTIONAL (Binance) ===
-      const market = this.exchange.markets[symbol];
-      const minCost = Number(market?.limits?.cost?.min || 0);
-      const notional = Number(preciseAmount) * Number(precisePrice);
-      if (minCost > 0 && notional < minCost - 1e-8) {
-        const requiredAmount = minCost / Number(precisePrice);
-        const adjustedAmount = this.exchange.amountToPrecision(symbol, requiredAmount);
-        const adjustedNotional = Number(adjustedAmount) * Number(precisePrice);
-        if (adjustedNotional >= minCost - 1e-8) {
-          console.warn(`[NOTIONAL] ${symbol} ${side} notional ${notional.toFixed(8)} < ${minCost}, adjusted amount ${preciseAmount} -> ${adjustedAmount}`);
-          preciseAmount = adjustedAmount;
-        } else {
-          console.warn(`[SKIP] ${symbol} ${side} level=${levelIndex} | notional ${notional.toFixed(8)} below min ${minCost} and cannot adjust`);
+      if (side === 'sell') {
+        const market = this.exchange.markets[symbol];
+        const minCost = Number(market?.limits?.cost?.min || 0);
+        const notional = Number(preciseAmount) * Number(precisePrice);
+        if (minCost > 0 && notional < minCost - 1e-8) {
+          console.warn(`[SKIP] ${symbol} SELL level=${levelIndex} | notional ${notional.toFixed(8)} below min ${minCost}, skipping order (dust)`);
           return null;
         }
       }
-      // ====================================
 
-      const orderParams = { newClientOrderId: clientOrderId };
-      if (GRID_POST_ONLY) {
-        orderParams.postOnly = true;
-      }
-
-      const order = await this.exchange.createLimitOrder(
-        symbol,
-        side,
-        preciseAmount,
-        precisePrice,
-        orderParams
-      );
+      const order = await this.createOrderWithFallback(symbol, side, preciseAmount, precisePrice, levelIndex);
       this.state.rememberOrder(symbol, order, { levelIndex });
       console.log(`[GRID] ${symbol} ${side.toUpperCase()} level=${levelIndex} amount=${preciseAmount} price=${precisePrice}${GRID_POST_ONLY ? ' (postOnly)' : ''}`);
       return order;
     } catch (err) {
       if (this.isInsufficientFundsError(err)) {
         console.warn(
-          `[SKIP] ${symbol} ${side.toUpperCase()} level=${levelIndex} amount=${preciseAmount} price=${precisePrice} | insufficient balance`
+          `[SKIP] ${symbol} ${side.toUpperCase()} level=${levelIndex} amount=${amount} price=${price} | insufficient balance`
         );
         return null;
       }
@@ -1119,111 +1341,55 @@ class SpotGridEngine {
     return Number(trade.fee?.cost || trade.info?.commission || 0);
   }
 
-  amountAfterBuyFee(symbol, trade) {
-    const amount = Number(trade.amount);
-    const feeCost = this.getTradeFeeCost(trade);
-    const feeCurrency = this.getTradeFeeCurrency(trade);
-    const base = this.getBaseAsset(symbol).toUpperCase();
-    if (feeCurrency === base) return Math.max(0, amount - feeCost);
-    return amount;
+  feeToQuote(feeCost, feeCurrency, price, baseAsset, quoteAsset) {
+    if (feeCurrency === quoteAsset) return feeCost;
+    if (feeCurrency === baseAsset) return feeCost * price;
+    console.warn(`[FEE] Unknown fee currency ${feeCurrency}, cannot convert to ${quoteAsset}. Fee amount = ${feeCost}`);
+    return 0;
   }
 
-  estimateGridProfit(symbol, buy, sellTrade) {
-    if (!buy) return { profit: 0, externalFees: [] };
-    const base = this.getBaseAsset(symbol).toUpperCase();
-    const quote = this.getQuoteAsset(symbol).toUpperCase();
-    const sellPrice = Number(sellTrade.price);
-    const sellAmount = Number(sellTrade.amount);
-    const buyPrice = Number(buy.price);
-    const buyAmount = Number(buy.amount);
-    const buyFee = Number(buy.fee || 0);
-    const buyFeeCurrency = String(buy.feeCurrency || '').toUpperCase();
-    const sellFee = this.getTradeFeeCost(sellTrade);
-    const sellFeeCurrency = this.getTradeFeeCurrency(sellTrade);
-    let profit = (sellPrice * sellAmount) - (buyPrice * buyAmount);
-    const externalFees = [];
-    if (buyFeeCurrency === quote) profit -= buyFee;
-    else if (buyFeeCurrency && buyFeeCurrency !== base) externalFees.push(`${buyFee} ${buyFeeCurrency}`);
-    if (sellFeeCurrency === quote) profit -= sellFee;
-    else if (sellFeeCurrency === base) profit -= sellFee * sellPrice;
-    else if (sellFeeCurrency) externalFees.push(`${sellFee} ${sellFeeCurrency}`);
-    return { profit, externalFees };
-  }
-
-  amountForBuy(symbol, price) {
-    const market = this.exchange.markets[symbol];
-    const minCost = Number(market?.limits?.cost?.min || 0);
-    const notional = Math.max(this.getOrderSizeUsdt(), minCost);
-    return notional / price;
-  }
-
-  amountForTrackedSell(symbol, sellLevelIndex) {
-    const symState = this.state.getSymbol(symbol);
-    const buy = symState.lastBuyByLevel[sellLevelIndex - 1];
-    if (!buy) return 0;
-    return Math.max(0, Number(buy.sellableAmount ?? buy.amount) || 0);
-  }
-
-  isOrderInsideRange(order, lower, upper) {
-    const price = Number(order.price);
-    const rangeSize = upper - lower;
-    const relativeEpsilon = Math.max(rangeSize * 0.0005, price * 0.00001);
-    return price >= lower - relativeEpsilon && price <= upper + relativeEpsilon;
-  }
-
-  isOrderCloseToPriceLevel(orderPrice, levels) {
-    const price = Number(orderPrice);
-    for (const level of levels) {
-      const tolerance = Math.max(level * 0.01, 1e-8);
-      if (Math.abs(price - level) <= tolerance) return true;
-    }
-    return false;
-  }
-
-  getTradeId(trade) {
-    return String(trade.id || `${trade.order}-${trade.timestamp}`);
-  }
-
-  forgetOrderIfClosed(symState, trade, openOrderIds) {
-    if (!openOrderIds.has(String(trade.order))) {
-      delete symState.orders[String(trade.order)];
-    }
-  }
-
-  async fetchNewTrades(symbol, symState) {
-    const since = symState.lastTradeTimestamp || 0;
-    let allTrades = [];
-    let from = since;
-    while (true) {
-      const trades = await retry(() => this.exchange.fetchMyTrades(symbol, from, TRADE_FETCH_LIMIT));
-      if (!trades.length) break;
-      allTrades = allTrades.concat(trades);
-      const lastTimestamp = trades[trades.length - 1].timestamp;
-      if (trades.length < TRADE_FETCH_LIMIT) break;
-      from = lastTimestamp + 1;
-      await sleep(100);
-    }
-    if (allTrades.length) {
-      const maxTs = Math.max(...allTrades.map(t => t.timestamp));
-      symState.lastTradeTimestamp = maxTs + 1;
-      this.state.save();
-    }
-    return allTrades;
-  }
-
-  // FIXED: removed profit check that prevented sell orders
   async handleBuyFill(symbol, levels, aiDecision, symState, trade, orderMeta, openOrderIds) {
     const price = Number(trade.price);
     const amount = Number(trade.amount);
     const levelIndex = Number(orderMeta.levelIndex);
-    const fee = this.getTradeFeeCost(trade);
+    const feeCost = this.getTradeFeeCost(trade);
     const feeCurrency = this.getTradeFeeCurrency(trade);
+    const base = this.getBaseAsset(symbol);
+    const quote = this.getQuoteAsset(symbol);
     const sellableAmount = this.amountAfterBuyFee(symbol, trade);
-    symState.lastBuyByLevel[levelIndex] = { price, amount, sellableAmount, fee, feeCurrency, at: trade.datetime };
+    const costQuote = price * amount;
+    const feeQuote = this.feeToQuote(feeCost, feeCurrency, price, base, quote);
+    
+    const existing = symState.lastBuyByLevel[levelIndex];
+    if (existing) {
+      const totalAmount = existing.amount + amount;
+      const totalSellable = (existing.sellableAmount ?? existing.amount) + sellableAmount;
+      const totalCostQuote = existing.totalCostQuote + costQuote;
+      const totalFeeQuote = existing.totalFeeQuote + feeQuote;
+      const avgPrice = totalCostQuote / totalAmount;
+      symState.lastBuyByLevel[levelIndex] = {
+        price: avgPrice,
+        amount: totalAmount,
+        sellableAmount: totalSellable,
+        totalCostQuote: totalCostQuote,
+        totalFeeQuote: totalFeeQuote,
+        at: trade.datetime,
+      };
+    } else {
+      symState.lastBuyByLevel[levelIndex] = {
+        price,
+        amount,
+        sellableAmount,
+        totalCostQuote: costQuote,
+        totalFeeQuote: feeQuote,
+        at: trade.datetime,
+      };
+    }
+    
     this.state.data.totals.filledBuys++;
     this.forgetOrderIfClosed(symState, trade, openOrderIds);
     this.state.markProcessedTrade(symbol, this.getTradeId(trade));
-    await this.sendAlert(`[GRID BUY] ${symbol} amount=${amount} @ ${price} | sellable=${sellableAmount}`);
+    await this.sendAlert(`[GRID BUY] ${symbol} amount=${amount} @ ${price} | sellable=${sellableAmount} | fee=${feeQuote.toFixed(4)} ${quote}`);
     if (!GRID_REFILL_ON_FILLED || !aiDecision.allowTrading || !aiDecision.allowSell || levelIndex + 1 >= levels.length) return;
     const sellPrice = levels[levelIndex + 1];
     if (sellableAmount > 0) {
@@ -1239,23 +1405,100 @@ class SpotGridEngine {
     const levelIndex = Number(orderMeta.levelIndex);
     const buyLevelIndex = symState.lastBuyByLevel[levelIndex - 1] ? levelIndex - 1 : levelIndex;
     const buy = symState.lastBuyByLevel[buyLevelIndex];
-    const profitEstimate = this.estimateGridProfit(symbol, buy, trade);
-    const estimatedProfit = profitEstimate.profit;
-    symState.realizedGridProfit += estimatedProfit;
-    this.state.data.totals.realizedGridProfit += estimatedProfit;
+    if (!buy) {
+      console.warn(`[SELL] ${symbol} level ${levelIndex} has no corresponding buy record. Skipping profit calculation.`);
+      this.forgetOrderIfClosed(symState, trade, openOrderIds);
+      this.state.markProcessedTrade(symbol, this.getTradeId(trade));
+      return;
+    }
+    
+    const base = this.getBaseAsset(symbol);
+    const quote = this.getQuoteAsset(symbol);
+    const feeCost = this.getTradeFeeCost(trade);
+    const feeCurrency = this.getTradeFeeCurrency(trade);
+    const proceedsQuote = price * amount;
+    const feeQuote = this.feeToQuote(feeCost, feeCurrency, price, base, quote);
+    
+    const totalBuyAmount = buy.amount;
+    const sellableAtBuy = buy.sellableAmount ?? totalBuyAmount;
+    const proportion = Math.min(amount / sellableAtBuy, 1.0);
+    const allocatedBuyCost = buy.totalCostQuote * proportion;
+    const allocatedBuyFee = buy.totalFeeQuote * proportion;
+    const profit = (proceedsQuote - feeQuote) - (allocatedBuyCost + allocatedBuyFee);
+    
+    symState.realizedGridProfit += profit;
+    this.state.data.totals.realizedGridProfit += profit;
     this.state.data.totals.filledSells++;
     this.forgetOrderIfClosed(symState, trade, openOrderIds);
-    if (buy) {
-      const remainingAmount = Number(buy.sellableAmount ?? buy.amount) - amount;
-      if (remainingAmount > 0) buy.sellableAmount = remainingAmount;
-      else delete symState.lastBuyByLevel[buyLevelIndex];
+    
+    const remainingSellable = sellableAtBuy - amount;
+    if (remainingSellable > 0) {
+      const newProportion = remainingSellable / sellableAtBuy;
+      buy.sellableAmount = remainingSellable;
+      buy.totalCostQuote = buy.totalCostQuote * newProportion;
+      buy.totalFeeQuote = buy.totalFeeQuote * newProportion;
+      buy.amount = buy.amount * newProportion;
+    } else {
+      delete symState.lastBuyByLevel[buyLevelIndex];
     }
+    
     this.state.markProcessedTrade(symbol, this.getTradeId(trade));
-    const externalFeeText = profitEstimate.externalFees.length ? ` | external fees=${profitEstimate.externalFees.join(', ')}` : '';
-    await this.sendAlert(`[GRID SELL] ${symbol} amount=${amount} @ ${price} | est profit=${estimatedProfit.toFixed(4)} USDT${externalFeeText}`);
+    await this.sendAlert(`[GRID SELL] ${symbol} amount=${amount} @ ${price} | profit=${profit.toFixed(4)} ${quote} | fee=${feeQuote.toFixed(4)} ${quote}`);
+    
     if (GRID_REFILL_ON_FILLED && aiDecision.allowTrading && aiDecision.allowBuy && levelIndex - 1 >= 0) {
-      await this.placeLimit(symbol, 'buy', levelIndex - 1, levels[levelIndex - 1], amount);
+      const buyPrice = levels[levelIndex - 1];
+      const orderSizeUsdt = this.getOrderSizeUsdt();
+      const newBuyAmount = orderSizeUsdt / buyPrice;
+      const market = this.exchange.markets[symbol];
+      const minCost = Number(market?.limits?.cost?.min || 0);
+      let amountToBuy = newBuyAmount;
+      let cost = amountToBuy * buyPrice;
+      if (minCost > 0 && cost < minCost - 1e-8) {
+        amountToBuy = minCost / buyPrice;
+        cost = amountToBuy * buyPrice;
+        if (cost < minCost - 1e-8) {
+          console.warn(`[SKIP] ${symbol} BUY refill level=${levelIndex - 1} | cannot meet min notional ${minCost}`);
+          return;
+        }
+      }
+      await this.placeLimit(symbol, 'buy', levelIndex - 1, buyPrice, amountToBuy);
     }
+  }
+
+  getTradeId(trade) {
+    return String(trade.id || `${trade.order}-${trade.timestamp}`);
+  }
+
+  forgetOrderIfClosed(symState, trade, openOrderIds) {
+    if (!openOrderIds.has(String(trade.order))) {
+      delete symState.orders[String(trade.order)];
+      this.state.save();
+    }
+  }
+
+  async fetchNewTrades(symbol, symState) {
+    const since = symState.lastTradeTimestamp || 0;
+    let allTrades = [];
+    let from = since;
+    let maxIterations = 10;
+    let iteration = 0;
+    while (iteration < maxIterations) {
+      const trades = await retry(() => this.exchange.fetchMyTrades(symbol, from, TRADE_FETCH_LIMIT));
+      if (!trades.length) break;
+      allTrades = allTrades.concat(trades);
+      const lastTimestamp = trades[trades.length - 1].timestamp;
+      if (trades.length < TRADE_FETCH_LIMIT) break;
+      if (lastTimestamp === from) break;
+      from = lastTimestamp + 1;
+      iteration++;
+      await sleep(200);
+    }
+    if (allTrades.length) {
+      const maxTs = Math.max(...allTrades.map(t => t.timestamp));
+      symState.lastTradeTimestamp = maxTs + 1;
+      this.state.save();
+    }
+    return allTrades;
   }
 
   async handleFilledTrades(symbol, levels, aiDecision) {
@@ -1343,16 +1586,26 @@ class SpotGridEngine {
     finalContext.trailingUpJustShifted = !!trailedUp;
     finalContext.trailingDownJustShifted = !!trailedDown;
 
-    const aiDecision = await this.aiValidator.validate(symbol, finalContext, { ignoreMinInterval: !!(trailedUp || trailedDown) });
+    const symState = this.state.getSymbol(symbol);
+    const aiDecision = await this.aiValidator.validate(
+      symbol,
+      finalContext,
+      { ignoreMinInterval: !!(trailedUp || trailedDown) },
+      symState.realizedGridProfit
+    );
     if (AI_VALIDATION_ENABLED) {
       console.log(
         `[AI] ${symbol}${trailedUp ? ' trailing-up' : ''}${trailedDown ? ' trailing-down' : ''} ` +
         `allow=${aiDecision.allowTrading} buy=${aiDecision.allowBuy} sell=${aiDecision.allowSell} ` +
-        `confidence=${aiDecision.confidence} | ${aiDecision.reason}`
+        `confidence=${aiDecision.confidence.toFixed(1)} | ${aiDecision.reason}`
       );
     }
 
     await this.handleFilledTrades(symbol, levels, aiDecision);
+
+    if (this.aiValidator.learningMemory) {
+      this.aiValidator.learningMemory.updateOutcomes(symbol, symState.realizedGridProfit);
+    }
 
     let freshOpenOrders = await retry(() => this.exchange.fetchOpenOrders(symbol));
     let managedOrders = this.getManagedOpenOrders(symbol, freshOpenOrders);
@@ -1363,7 +1616,7 @@ class SpotGridEngine {
         const orderTimestamp = Date.parse(order.timestamp || order.datetime || 0);
         const orderAgeMs = Date.now() - orderTimestamp;
         if (orderAgeMs < recentThresholdMs) continue;
-        const isValidGridOrder = this.isOrderCloseToPriceLevel(order.price, levels);
+        const isValidGridOrder = this.isOrderCloseToPriceLevel(order.price, levels, this.exchange.markets[symbol]);
         if (isValidGridOrder) continue;
         if (!this.isOrderInsideRange(order, lower, upper)) {
           await this.cancelOrder(symbol, order, `outside range ${roundNumber(lower)}-${roundNumber(upper)}`);
@@ -1396,8 +1649,21 @@ class SpotGridEngine {
     for (const level of below) {
       if (!aiDecision.allowTrading || !aiDecision.allowBuy) break;
       if (activeBuyLevels.has(level.index)) continue;
-      const amount = this.amountForBuy(symbol, level.price);
-      const cost = amount * level.price;
+      let amount = this.amountForBuy(symbol, level.price);
+      let cost = amount * level.price;
+      
+      const market = this.exchange.markets[symbol];
+      const minCost = Number(market?.limits?.cost?.min || 0);
+      if (minCost > 0 && cost < minCost - 1e-8) {
+        const requiredAmount = minCost / level.price;
+        amount = this.exchange.amountToPrecision(symbol, requiredAmount);
+        cost = Number(amount) * level.price;
+        if (cost < minCost - 1e-8) {
+          console.warn(`[SKIP] ${symbol} BUY level=${level.index} | cannot meet min notional ${minCost}`);
+          break;
+        }
+      }
+      
       if (quoteFree < cost) break;
       const order = await this.placeLimit(symbol, 'buy', level.index, level.price, amount);
       if (!order) break;
@@ -1407,10 +1673,22 @@ class SpotGridEngine {
     for (const level of above) {
       if (!aiDecision.allowTrading || !aiDecision.allowSell) break;
       if (activeSellLevels.has(level.index)) continue;
-      const trackedAmount = this.amountForTrackedSell(symbol, level.index);
+      let trackedAmount = this.amountForTrackedSell(symbol, level.index);
       if (!(trackedAmount > 0)) continue;
-      const amount = Math.min(trackedAmount, baseFree);
+      let amount = Math.min(trackedAmount, baseFree);
       if (!(amount > 0)) break;
+      
+      const market = this.exchange.markets[symbol];
+      const minCost = Number(market?.limits?.cost?.min || 0);
+      const notional = amount * level.price;
+      if (minCost > 0 && notional < minCost - 1e-8) {
+        console.warn(`[SKIP] ${symbol} SELL level=${level.index} | notional too low (dust), deleting corresponding buy`);
+        const symState = this.state.getSymbol(symbol);
+        delete symState.lastBuyByLevel[level.index - 1];
+        this.state.save();
+        continue;
+      }
+      
       const order = await this.placeLimit(symbol, 'sell', level.index, level.price, amount);
       if (!order) break;
       baseFree -= amount;
@@ -1418,8 +1696,48 @@ class SpotGridEngine {
 
     console.log(
       `[SYNC] ${symbol} price=${roundNumber(currentPrice)} range=${roundNumber(lower)}-${roundNumber(upper)} ` +
-      `orders=${managedOrders.length} estProfit=${roundNumber(this.state.getSymbol(symbol).realizedGridProfit, 4)}`
+      `orders=${managedOrders.length} totalProfit=${roundNumber(this.state.getSymbol(symbol).realizedGridProfit, 4)} ${this.getQuoteAsset(symbol)}`
     );
+  }
+
+  amountForTrackedSell(symbol, sellLevelIndex) {
+    const symState = this.state.getSymbol(symbol);
+    const buy = symState.lastBuyByLevel[sellLevelIndex - 1];
+    if (!buy) return 0;
+    return Math.max(0, Number(buy.sellableAmount ?? buy.amount) || 0);
+  }
+
+  amountForBuy(symbol, price) {
+    const market = this.exchange.markets[symbol];
+    const minCost = Number(market?.limits?.cost?.min || 0);
+    const notional = Math.max(this.getOrderSizeUsdt(), minCost);
+    return notional / price;
+  }
+
+  isOrderInsideRange(order, lower, upper) {
+    const price = Number(order.price);
+    const rangeSize = upper - lower;
+    const relativeEpsilon = Math.max(rangeSize * 0.0005, price * 0.00001);
+    return price >= lower - relativeEpsilon && price <= upper + relativeEpsilon;
+  }
+
+  isOrderCloseToPriceLevel(orderPrice, levels, market) {
+    const price = Number(orderPrice);
+    const tickSize = market?.precision?.price || 0.00001;
+    for (const level of levels) {
+      if (Math.abs(price - level) <= tickSize * 1.5) return true;
+    }
+    return false;
+  }
+
+  amountAfterBuyFee(symbol, trade) {
+    const amount = Number(trade.amount);
+    const feeCost = this.getTradeFeeCost(trade);
+    const feeCurrency = this.getTradeFeeCurrency(trade);
+    const base = this.getBaseAsset(symbol).toUpperCase();
+    let result = amount;
+    if (feeCurrency === base) result = Math.max(0, amount - feeCost);
+    return result;
   }
 
   async executeCycle() {
@@ -1488,6 +1806,7 @@ Max Active Orders: buy=${GRID_MAX_ACTIVE_BUY_ORDERS}, sell=${GRID_MAX_ACTIVE_SEL
 Recreate On Start: ${GRID_RECREATE_ON_START ? 'ON' : 'OFF'}
 AI Validation: ${AI_VALIDATION_ENABLED ? `ON (${GEMINI_MODEL})` : 'OFF'}
 Post Only (Maker): ${GRID_POST_ONLY ? 'ON' : 'OFF'}
+Learning Memory: ${LEARNING_MEMORY_ENABLED ? 'ON' : 'OFF'}
 `);
     await this.init();
     while (true) {
