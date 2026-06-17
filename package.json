@@ -1,0 +1,19 @@
+{
+  "name": "binance-spot-grid-bot",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "test": "node --test"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "@google/generative-ai": "^0.24.1",
+    "ccxt": "^4.5.54",
+    "dotenv": "^17.4.2"
+  }
+}
