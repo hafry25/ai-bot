@@ -273,24 +273,36 @@ class ProcessLock {
     }
   }
 
+  // Returns true if lock file was removed or does not exist, false if valid lock exists.
   cleanupStaleLock() {
     try {
       const owner = this.readOwner();
       if (!this.processIsAlive(owner.pid)) {
-        console.warn(`[LOCK] Stale lock detected (PID ${owner.pid} is dead). Leaving ${this.lockPath} in place`);
+        console.warn(`[LOCK] Deleting stale lock ${this.lockPath} (PID ${owner.pid} is dead)`);
+        fs.unlinkSync(this.lockPath);
         return true;
       }
+      // lock is valid, still exists
+      return false;
     } catch (err) {
-      if (err.code !== 'ENOENT') {
-        console.warn(`[LOCK] Corrupt/invalid lock file: ${this.lockPath} - ${err.message}`);
-        return true;
-      }
+      if (err.code === 'ENOENT') return true; // doesn't exist
+      // corrupt or other error: delete it
+      console.warn(`[LOCK] Corrupt/invalid lock file: ${this.lockPath} - ${err.message}`);
+      try { fs.unlinkSync(this.lockPath); } catch (_) {}
+      return true;
     }
-    return false;
   }
 
   acquire() {
-    this.cleanupStaleLock();
+    // Clean up any stale lock
+    const lockRemoved = this.cleanupStaleLock();
+    if (!lockRemoved) {
+      // lock file exists and is valid
+      const owner = this.readOwner();
+      throw new Error(`Bot already running with PID ${owner.pid}. Lock: ${this.lockPath}`);
+    }
+
+    // Try to create the lock file
     try {
       this.fd = fs.openSync(this.lockPath, 'wx');
       this.ownerToken = crypto.randomUUID();
@@ -310,11 +322,29 @@ class ProcessLock {
       return;
     } catch (err) {
       if (err.code !== 'EEXIST') throw err;
+      // Race condition: someone else created the lock just after our cleanup.
       const owner = this.readOwner();
-      if (!this.processIsAlive(owner.pid)) {
-        throw new Error(`Stale bot lock found for PID ${owner.pid}. Lock: ${this.lockPath}`);
+      if (this.processIsAlive(owner.pid)) {
+        throw new Error(`Bot already running with PID ${owner.pid}. Lock: ${this.lockPath}`);
+      } else {
+        // stale lock, delete and retry
+        fs.unlinkSync(this.lockPath);
+        this.fd = fs.openSync(this.lockPath, 'wx');
+        this.ownerToken = crypto.randomUUID();
+        fs.writeFileSync(this.fd, JSON.stringify({
+          pid: process.pid,
+          token: this.ownerToken,
+          acquiredAt: new Date().toISOString(),
+        }));
+        fs.fsyncSync(this.fd);
+        if (!this.ownsLock()) {
+          fs.closeSync(this.fd);
+          this.fd = null;
+          this.ownerToken = null;
+          throw new Error(`Lost bot lock during acquisition: ${this.lockPath}`);
+        }
+        console.log(`[LOCK] Acquired lock ${this.lockPath} for PID ${process.pid} (after retry)`);
       }
-      throw new Error(`Bot already running with PID ${owner.pid}. Lock: ${this.lockPath}`);
     }
   }
 
@@ -1103,6 +1133,10 @@ class SpotGridEngine {
   }
 
   async applyTrailingRangeShift(symbol, lower, upper, shift, direction) {
+    // 1. Cancel existing grid orders first (so we don't leave stale orders if something fails)
+    await this.cancelGridOrders(symbol, `trailing-${direction}`);
+
+    // 2. Now update state
     const symState = this.state.getSymbol(symbol);
     const trailingState = direction === 'up'
       ? this.getTrailingUpState(symbol)
@@ -1124,8 +1158,6 @@ class SpotGridEngine {
     trailingState.lastShiftAt = new Date().toISOString();
     this.state.save();
 
-    await this.cancelGridOrders(symbol, `trailing-${direction}`);
-
     console.log(
       `[TRAILING ${direction.toUpperCase()}] ${symbol} shifted ${shift.steps} grid(s): ` +
       `${roundNumber(lower)}-${roundNumber(upper)} -> ${roundNumber(shift.lower)}-${roundNumber(shift.upper)}`
@@ -1145,7 +1177,12 @@ class SpotGridEngine {
     if (GRID_TRAILING_UP_COOLDOWN_MS > Date.now() - lastShiftAt) return null;
     const shift = this.calculateTrailingShift(currentPrice, lower, upper, 'up');
     if (!shift) return null;
-    return this.applyTrailingRangeShift(symbol, lower, upper, shift, 'up');
+    try {
+      return await this.applyTrailingRangeShift(symbol, lower, upper, shift, 'up');
+    } catch (err) {
+      console.error(`[TRAILING] Up shift failed for ${symbol}:`, err);
+      return null;
+    }
   }
 
   async maybeTrailDownRange(symbol, currentPrice, lower, upper) {
@@ -1155,7 +1192,12 @@ class SpotGridEngine {
     if (GRID_TRAILING_DOWN_COOLDOWN_MS > Date.now() - lastShiftAt) return null;
     const shift = this.calculateTrailingShift(currentPrice, lower, upper, 'down');
     if (!shift) return null;
-    return this.applyTrailingRangeShift(symbol, lower, upper, shift, 'down');
+    try {
+      return await this.applyTrailingRangeShift(symbol, lower, upper, shift, 'down');
+    } catch (err) {
+      console.error(`[TRAILING] Down shift failed for ${symbol}:`, err);
+      return null;
+    }
   }
 
   buildLevels(lower, upper) {
@@ -1240,9 +1282,13 @@ class SpotGridEngine {
     const openOrders = await retry(() => this.exchange.fetchOpenOrders(symbol));
     const managed = this.getManagedOpenOrders(symbol, openOrders);
     for (const order of managed) {
-      await retry(() => this.exchange.cancelOrder(order.id, symbol));
-      this.state.forgetOrder(symbol, order.id);
-      console.log(`[CANCEL] ${symbol} ${order.side} ${order.id} | ${reason}`);
+      try {
+        await retry(() => this.exchange.cancelOrder(order.id, symbol));
+        this.state.forgetOrder(symbol, order.id);
+        console.log(`[CANCEL] ${symbol} ${order.side} ${order.id} | ${reason}`);
+      } catch (err) {
+        console.warn(`[CANCEL] Failed to cancel ${symbol} order ${order.id}: ${err.message}`);
+      }
     }
   }
 
@@ -1782,13 +1828,21 @@ class SpotGridEngine {
   async executeCycle() {
     if (this.isRunning) return;
     this.isRunning = true;
+    let hadError = false;
     try {
       if (!this.circuitAllows() || killSwitchActive()) return;
       for (const symbol of SYMBOLS) {
-        await this.reconcileSymbol(symbol);
+        try {
+          await this.reconcileSymbol(symbol);
+        } catch (err) {
+          hadError = true;
+          console.error(`[CYCLE] Error on ${symbol}:`, err);
+          this.recordError();
+        }
       }
-      this.recordSuccess();
+      if (!hadError) this.recordSuccess();
     } catch (err) {
+      hadError = true;
       console.error('[CYCLE]', err);
       this.recordError();
     } finally {
