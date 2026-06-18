@@ -138,6 +138,33 @@ const TRADE_FETCH_LIMIT = 100;
 const CIRCUIT_BREAKER_MAX_ERRORS = 5;
 const CIRCUIT_BREAKER_PAUSE_MS = 15 * MINUTE_MS;
 
+class AtomicFileWriter {
+  static queues = new Map();
+  static counter = 0;
+
+  static write(filePath, buildContents) {
+    const previous = AtomicFileWriter.queues.get(filePath) || Promise.resolve();
+    const sequence = ++AtomicFileWriter.counter;
+    const current = previous
+      .catch(() => {})
+      .then(async () => {
+        const tempPath = `${filePath}.${process.pid}.${sequence}.tmp`;
+        await fs.promises.writeFile(tempPath, buildContents());
+        await fs.promises.rename(tempPath, filePath);
+      })
+      .catch(err => {
+        console.warn(`[FILE] Failed to persist ${filePath}:`, err.message);
+      })
+      .finally(() => {
+        if (AtomicFileWriter.queues.get(filePath) === current) {
+          AtomicFileWriter.queues.delete(filePath);
+        }
+      });
+    AtomicFileWriter.queues.set(filePath, current);
+    return current;
+  }
+}
+
 // ------------------------------
 //  Utility Functions
 // ------------------------------
@@ -258,6 +285,17 @@ function validateRuntimeConfiguration() {
   }
   if (FONNTE_ENABLED && (!FONNTE_TOKEN || !FONNTE_TARGET)) {
     errors.push('FONNTE_TOKEN and FONNTE_TARGET are required when FONNTE_ENABLED=true');
+  }
+
+  if (
+    GRID_TOTAL_INVESTMENT_USDT > 0 &&
+    GRID_ORDER_SIZE_USDT > 0 &&
+    GRID_TOTAL_INVESTMENT_USDT / Math.max(GRID_COUNT, 1) < GRID_ORDER_SIZE_USDT
+  ) {
+    console.warn(
+      `[CONFIG] GRID_TOTAL_INVESTMENT_USDT takes precedence; effective per-grid order size is ` +
+      `${roundNumber(GRID_TOTAL_INVESTMENT_USDT / Math.max(GRID_COUNT, 1), 8)} USDT, below GRID_ORDER_SIZE_USDT=${GRID_ORDER_SIZE_USDT}`
+    );
   }
 
   if (errors.length) {
@@ -506,9 +544,7 @@ class GridState {
 
   save() {
     this.data.updatedAt = new Date().toISOString();
-    const tempPath = `${GRID_STATE_PATH}.${process.pid}.tmp`;
-    fs.writeFileSync(tempPath, JSON.stringify(this.data, null, 2));
-    fs.renameSync(tempPath, GRID_STATE_PATH);
+    AtomicFileWriter.write(GRID_STATE_PATH, () => JSON.stringify(this.data, null, 2));
   }
 
   getSymbol(symbol) {
@@ -607,9 +643,7 @@ class LearningMemory {
 
   save() {
     if (!this.isEnabled()) return;
-    const temp = `${this.filePath}.tmp`;
-    fs.writeFileSync(temp, `${JSON.stringify(this.records, null, 2)}\n`);
-    fs.renameSync(temp, this.filePath);
+    AtomicFileWriter.write(this.filePath, () => `${JSON.stringify(this.records, null, 2)}\n`);
   }
 
   normalizeRecord(record) {
@@ -1146,6 +1180,14 @@ Be conservative. Protect capital first.
             `[MEMORY] ${symbol} weighted success ${pctSuccess}% (${queryResult.samples} samples, weighted=${queryResult.weightedSamples}) ` +
             `-> confidence ${oldConfidence.toFixed(1)} -> ${decision.confidence.toFixed(1)} (factor=${factor.toFixed(2)})`
           );
+          if (decision.confidence < AI_MIN_CONFIDENCE) {
+            decision = AIGridValidator.block(
+              `Low AI confidence after memory adjustment: ${decision.reason}`,
+              decision.confidence
+            );
+            decision.allowBuy = false;
+            decision.allowSell = false;
+          }
         }
         this.learningMemory.recordDecision(symbol, context, decision, profit, features);
         this.setCached(cacheKey, decision);
@@ -1380,6 +1422,12 @@ class SpotGridEngine {
       String(order.side).toLowerCase() === side &&
       Number(order.levelIndex) === Number(levelIndex)
     );
+  }
+
+  countActiveOrders(symState, side) {
+    return Object.values(symState.orders).filter(order =>
+      String(order.side).toLowerCase() === side
+    ).length;
   }
 
   getPreciseOrderNumbers(symbol, price, amount) {
@@ -1773,6 +1821,10 @@ class SpotGridEngine {
       console.warn(`[SKIP] ${symbol} SELL refill level=${levelIndex + 1} | sell order already active`);
       return;
     }
+    if (this.countActiveOrders(symState, 'sell') >= GRID_MAX_ACTIVE_SELL_ORDERS) {
+      console.warn(`[SKIP] ${symbol} SELL refill level=${levelIndex + 1} | active sell order limit reached`);
+      return;
+    }
     if (sellableAmount > 0) {
       const market = this.exchange.markets[symbol];
       const minCost = Number(market?.limits?.cost?.min || 0);
@@ -1833,7 +1885,7 @@ class SpotGridEngine {
       buy.sellableAmount = remainingSellable;
       buy.totalCostQuote = buy.totalCostQuote * newProportion;
       buy.totalFeeQuote = buy.totalFeeQuote * newProportion;
-      buy.amount = buy.amount * newProportion;
+      buy.amount = remainingSellable;
     } else {
       delete symState.lastBuyByLevel[buyLevelIndex];
     }
@@ -1846,6 +1898,10 @@ class SpotGridEngine {
       const buyPrice = levels[levelIndex - 1];
       if (this.hasActiveOrderAtLevel(symState, 'buy', levelIndex - 1)) {
         console.warn(`[SKIP] ${symbol} BUY refill level=${levelIndex - 1} | buy order already active`);
+        return;
+      }
+      if (this.countActiveOrders(symState, 'buy') >= GRID_MAX_ACTIVE_BUY_ORDERS) {
+        console.warn(`[SKIP] ${symbol} BUY refill level=${levelIndex - 1} | active buy order limit reached`);
         return;
       }
       let amountToBuy = this.amountForBuy(symbol, buyPrice);

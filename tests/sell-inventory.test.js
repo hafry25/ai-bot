@@ -203,3 +203,105 @@ test('handleBuyFill skips refill sell when sell level is already active', async 
   assert.equal(symState.orders.sellOrder.levelIndex, 5);
   assert.equal(symState.lastBuyByLevel[4].sellableAmount, 10);
 });
+
+test('handleBuyFill skips refill sell when active sell order limit is reached', async () => {
+  const symState = {
+    orders: {
+      buyOrder: { side: 'buy', levelIndex: 4 },
+      sell1: { side: 'sell', levelIndex: 1 },
+      sell2: { side: 'sell', levelIndex: 2 },
+      sell3: { side: 'sell', levelIndex: 3 },
+      sell4: { side: 'sell', levelIndex: 6 },
+      sell5: { side: 'sell', levelIndex: 7 },
+    },
+    lastBuyByLevel: {},
+  };
+  let placed = false;
+  const engine = Object.create(SpotGridEngine.prototype);
+  engine.exchange = {
+    markets: {
+      'BONK/USDT': { limits: { cost: { min: 0 } } },
+    },
+    priceToPrecision: (_symbol, price) => String(price),
+    amountToPrecision: (_symbol, amount) => String(amount),
+  };
+  engine.state = {
+    data: {
+      totals: {
+        filledBuys: 0,
+      },
+    },
+    save: () => {},
+    markProcessedTrade: () => {},
+  };
+  engine.sendAlert = async () => {};
+  engine.placeLimit = async () => {
+    placed = true;
+  };
+
+  await engine.handleBuyFill(
+    'BONK/USDT',
+    [1, 2, 3, 4, 5, 6, 7, 8],
+    { allowTrading: true, allowSell: true },
+    symState,
+    { id: 'trade-1', order: 'buyOrder', price: 4, amount: 10, datetime: '2026-01-01T00:00:00.000Z', fee: { cost: 0, currency: 'USDT' } },
+    { levelIndex: 4 },
+    new Set(['sell1', 'sell2', 'sell3', 'sell4', 'sell5'])
+  );
+
+  assert.equal(placed, false);
+  assert.equal(symState.orders.buyOrder, undefined);
+  assert.equal(symState.lastBuyByLevel[4].sellableAmount, 10);
+});
+
+test('handleSellFill skips refill buy when active buy order limit is reached', async () => {
+  const symState = {
+    orders: {
+      sellOrder: { side: 'sell', levelIndex: 5 },
+      buy1: { side: 'buy', levelIndex: 0 },
+      buy2: { side: 'buy', levelIndex: 1 },
+      buy3: { side: 'buy', levelIndex: 2 },
+      buy4: { side: 'buy', levelIndex: 3 },
+      buy5: { side: 'buy', levelIndex: 6 },
+    },
+    lastBuyByLevel: {
+      4: {
+        amount: 10,
+        sellableAmount: 10,
+        totalCostQuote: 40,
+        totalFeeQuote: 0,
+      },
+    },
+    realizedGridProfit: 0,
+  };
+  let placed = false;
+  const engine = Object.create(SpotGridEngine.prototype);
+  engine.state = {
+    data: {
+      totals: {
+        realizedGridProfit: 0,
+        filledSells: 0,
+      },
+    },
+    save: () => {},
+    markProcessedTrade: () => {},
+  };
+  engine.sendAlert = async () => {};
+  engine.placeLimit = async () => {
+    placed = true;
+  };
+
+  await engine.handleSellFill(
+    'BONK/USDT',
+    [1, 2, 3, 4, 5, 6, 7],
+    { allowTrading: true, allowBuy: true },
+    symState,
+    { id: 'trade-1', order: 'sellOrder', price: 5, amount: 10, fee: { cost: 0, currency: 'USDT' } },
+    { levelIndex: 5 },
+    new Set(['buy1', 'buy2', 'buy3', 'buy4', 'buy5'])
+  );
+
+  assert.equal(placed, false);
+  assert.equal(symState.orders.sellOrder, undefined);
+  assert.equal(symState.lastBuyByLevel[4], undefined);
+});

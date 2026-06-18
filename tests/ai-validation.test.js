@@ -4,6 +4,7 @@ const assert = require('node:assert/strict');
 process.env.AI_VALIDATION_ENABLED = 'true';
 process.env.AI_VALIDATION_MIN_INTERVAL_MS = '60000';
 process.env.AI_VALIDATION_CACHE_TTL_MS = '60000';
+process.env.AI_MIN_CONFIDENCE = '70';
 process.env.GEMINI_API_KEY = 'test-key';
 
 const { AIGridValidator, LearningMemory } = require('../index');
@@ -118,6 +119,65 @@ test('AI validation refreshes cache after learning memory adjusts confidence', a
   assert.equal(decision.confidence, 92);
   assert.equal(remembered.confidence, 92);
   assert.match(decision.reason, /Memory: 100% weighted success/);
+});
+
+test('AI validation blocks when learning memory lowers confidence below threshold', async () => {
+  AIGridValidator.lastDecisionBySymbol.clear();
+  AIGridValidator.cache.clear();
+  AIGridValidator.rateLimitedUntil = 0;
+
+  const cachedValues = [];
+  const validator = Object.create(AIGridValidator.prototype);
+  validator.exchange = {
+    fetchOHLCV: async () => [
+      [1, 100, 101, 99, 100, 10],
+      [2, 100, 102, 99, 101, 10],
+    ],
+  };
+  validator.model = {
+    generateContent: async () => ({
+      response: {
+        text: () => JSON.stringify({
+          allowTrading: true,
+          allowBuy: true,
+          allowSell: true,
+          confidence: 72,
+          reason: 'borderline setup',
+        }),
+      },
+    }),
+  };
+  validator.getCached = () => null;
+  validator.setCached = (_key, value) => {
+    cachedValues.push({ ...value });
+  };
+  validator.learningMemory = {
+    enrichContext: () => ({ currentPrice: 100 }),
+    querySimilarWithFeatures: () => ({
+      samples: 5,
+      weightedRatio: 0,
+      ratio: 0,
+      weightedSamples: 5,
+      closestDistance: 0,
+    }),
+    recordDecision: () => {},
+  };
+
+  const decision = await validator.validate('BTC/USDT', {
+    currentPrice: 100,
+    lower: 90,
+    upper: 110,
+    levels: [90, 100, 110],
+  });
+  const remembered = AIGridValidator.lastDecisionBySymbol.get('BTC/USDT').value;
+
+  assert.equal(decision.allowTrading, false);
+  assert.equal(decision.allowBuy, false);
+  assert.equal(decision.allowSell, false);
+  assert.ok(decision.confidence < 70);
+  assert.match(decision.reason, /Low AI confidence after memory adjustment/);
+  assert.equal(cachedValues.at(-1).allowTrading, false);
+  assert.equal(remembered.allowTrading, false);
 });
 
 test('LearningMemory weighting favors recent outcomes', () => {
