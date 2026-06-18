@@ -50,7 +50,7 @@ test('AI prompt treats a completed trailing-down shift as expected', () => {
   assert.match(prompt, /Do not block solely because price is near the new lower bound/);
 });
 
-test('trailing-down updates auto range and shifts indexes one level up', async () => {
+test('trailing-down updates auto range, clears cancelled orders, and shifts buy lots', async () => {
   const symbolState = {
     config: { lower: 90, upper: 110 },
     orders: {
@@ -72,7 +72,7 @@ test('trailing-down updates auto range and shifts indexes one level up', async (
   assert.deepEqual(shifted, { lower: 88, upper: 108 });
   assert.equal(symbolState.config.lower, 88);
   assert.equal(symbolState.config.upper, 108);
-  assert.equal(symbolState.orders.buy.levelIndex, 1);
+  assert.deepEqual(symbolState.orders, {});
   assert.deepEqual(Object.keys(symbolState.lastBuyByLevel), ['5']);
   assert.equal(symbolState.trailingDown.shifts, 1);
   assert.match(symbolState.trailingDown.lastShiftAt, /^\d{4}-\d{2}-\d{2}T/);
@@ -100,7 +100,7 @@ test('trailing-down follows a large move by shifting multiple grids', async () =
   assert.deepEqual(shifted, { lower: 84, upper: 104 });
   assert.equal(symbolState.config.lower, 84);
   assert.equal(symbolState.config.upper, 104);
-  assert.equal(symbolState.orders.buy.levelIndex, 5);
+  assert.deepEqual(symbolState.orders, {});
   assert.deepEqual(Object.keys(symbolState.lastBuyByLevel), ['7']);
   assert.equal(symbolState.trailingDown.shifts, 3);
 });

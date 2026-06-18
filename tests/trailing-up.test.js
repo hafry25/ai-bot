@@ -50,7 +50,7 @@ test('AI prompt treats a completed trailing-up shift as expected', () => {
   assert.match(prompt, /Do not block solely because price is near the new upper bound/);
 });
 
-test('trailing-up follows a large move by shifting multiple grids', async () => {
+test('trailing-up follows a large move, clears cancelled orders, and shifts buy lots', async () => {
   const symbolState = {
     config: { lower: 90, upper: 110 },
     orders: {
@@ -72,7 +72,7 @@ test('trailing-up follows a large move by shifting multiple grids', async () => 
   assert.deepEqual(shifted, { lower: 96, upper: 116 });
   assert.equal(symbolState.config.lower, 96);
   assert.equal(symbolState.config.upper, 116);
-  assert.equal(symbolState.orders.buy.levelIndex, -1);
+  assert.deepEqual(symbolState.orders, {});
   assert.deepEqual(Object.keys(symbolState.lastBuyByLevel), ['1']);
   assert.equal(symbolState.trailingUp.shifts, 3);
 });
@@ -103,9 +103,9 @@ test('trailing-up keeps below-range buy lots on exit level', async () => {
 
   await engine.applyTrailingRangeShift('BTC/USDT', 90, 110, { lower: 92, upper: 112, steps: 1 }, 'up');
 
-  assert.deepEqual(Object.keys(symbolState.lastBuyByLevel), ['-1']);
-  assert.equal(symbolState.lastBuyByLevel[-1].sellableAmount, 0.99);
-  assert.equal(engine.amountForTrackedSell('BTC/USDT', 0), 0.99);
+  assert.deepEqual(Object.keys(symbolState.lastBuyByLevel), ['0']);
+  assert.equal(symbolState.lastBuyByLevel[0].sellableAmount, 0.99);
+  assert.equal(engine.amountForTrackedSell('BTC/USDT', 1), 0.99);
 });
 
 test('trailing-up aborts state shift when order cancellation fails', async () => {

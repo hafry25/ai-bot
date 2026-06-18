@@ -1370,6 +1370,31 @@ class SpotGridEngine {
     };
   }
 
+  clampBuyLevelIndex(levelIndex) {
+    return Math.max(0, Math.min(GRID_COUNT - 1, Number(levelIndex)));
+  }
+
+  hasActiveOrderAtLevel(symState, side, levelIndex) {
+    return Object.values(symState.orders).some(order =>
+      String(order.side).toLowerCase() === side &&
+      Number(order.levelIndex) === Number(levelIndex)
+    );
+  }
+
+  getPreciseOrderNumbers(symbol, price, amount) {
+    const precisePrice = this.exchange.priceToPrecision(symbol, price);
+    const preciseAmount = this.exchange.amountToPrecision(symbol, amount);
+    const priceNum = Number(precisePrice);
+    const amountNum = Number(preciseAmount);
+    return {
+      precisePrice,
+      preciseAmount,
+      priceNum,
+      amountNum,
+      notional: priceNum * amountNum,
+    };
+  }
+
   async applyTrailingRangeShift(symbol, lower, upper, shift, direction) {
     // 1. Cancel existing grid orders first (so we don't leave stale orders if something fails)
     const cancelResult = await this.cancelGridOrders(symbol, `trailing-${direction}`);
@@ -1385,26 +1410,25 @@ class SpotGridEngine {
       : this.getTrailingDownState(symbol);
     const offset = direction === 'up' ? -shift.steps : shift.steps;
 
+    if (Object.keys(symState.orders).length > 0) {
+      console.warn(
+        `[TRAILING] ${symbol} had ${Object.keys(symState.orders).length} managed order(s) after cancellation; clearing stale local metadata`
+      );
+      symState.orders = {};
+    }
+
     symState.config.lower = shift.lower;
     symState.config.upper = shift.upper;
 
     const cleanedBuys = {};
     for (const [idx, buy] of Object.entries(symState.lastBuyByLevel)) {
       const newIdx = Number(idx) + offset;
-      const exitIdx = newIdx < 0
-        ? -1
-        : newIdx >= GRID_COUNT
-          ? GRID_COUNT - 1
-          : newIdx;
-      if (exitIdx >= -1 && exitIdx < GRID_COUNT) {
-        cleanedBuys[exitIdx] = this.mergeBuyRecords(cleanedBuys[exitIdx], buy);
-        if (exitIdx !== newIdx) {
-          console.warn(
-            `[TRAILING] Keeping buy at shifted level ${newIdx} as exit level ${exitIdx} after ${direction} shift`
-          );
-        }
-      } else {
-        console.warn(`[TRAILING] Dropping buy at level ${idx} (out of new range after ${direction} shift)`);
+      const exitIdx = this.clampBuyLevelIndex(newIdx);
+      cleanedBuys[exitIdx] = this.mergeBuyRecords(cleanedBuys[exitIdx], buy);
+      if (exitIdx !== newIdx) {
+        console.warn(
+          `[TRAILING] Keeping buy at shifted level ${newIdx} as boundary buy level ${exitIdx} after ${direction} shift`
+        );
       }
     }
     symState.lastBuyByLevel = cleanedBuys;
@@ -1596,10 +1620,14 @@ class SpotGridEngine {
 
     this.pendingOrderLevels.add(pendingKey);
     try {
-      const precisePrice = this.exchange.priceToPrecision(symbol, price);
-      const preciseAmount = this.exchange.amountToPrecision(symbol, amount);
+      const {
+        precisePrice,
+        preciseAmount,
+        priceNum: preciseNum,
+        amountNum: preciseAmountNum,
+        notional,
+      } = this.getPreciseOrderNumbers(symbol, price, amount);
       const priceNum = Number(price);
-      const preciseNum = Number(precisePrice);
       const priceDiffPct = Math.abs(preciseNum - priceNum) / priceNum * 100;
       if (priceDiffPct > GRID_PRICE_PRECISION_MAX_DEVIATION_PCT) {
         console.warn(
@@ -1611,11 +1639,15 @@ class SpotGridEngine {
       if (side === 'sell') {
         const market = this.exchange.markets[symbol];
         const minCost = Number(market?.limits?.cost?.min || 0);
-        const notional = Number(preciseAmount) * Number(precisePrice);
         if (minCost > 0 && notional < minCost - 1e-8) {
           console.warn(`[SKIP] ${symbol} SELL level=${levelIndex} | notional ${notional.toFixed(8)} below min ${minCost}, skipping order (dust)`);
           return null;
         }
+      }
+
+      if (!(preciseAmountNum > 0) || !(preciseNum > 0)) {
+        console.warn(`[SKIP] ${symbol} ${side.toUpperCase()} level=${levelIndex} | amount or price rounded to zero`);
+        return null;
       }
 
       const order = await this.createOrderWithFallback(symbol, side, preciseAmount, precisePrice, levelIndex);
@@ -1736,12 +1768,14 @@ class SpotGridEngine {
     await this.sendAlert(`[GRID BUY] ${symbol} amount=${amount} @ ${price} | sellable=${sellableAmount} | fee=${feeQuote.toFixed(4)} ${quote}`);
     if (!GRID_REFILL_ON_FILLED || !aiDecision.allowTrading || !aiDecision.allowSell || levelIndex + 1 >= levels.length) return;
     const sellPrice = levels[levelIndex + 1];
+    if (this.hasActiveOrderAtLevel(symState, 'sell', levelIndex + 1)) {
+      console.warn(`[SKIP] ${symbol} SELL refill level=${levelIndex + 1} | sell order already active`);
+      return;
+    }
     if (sellableAmount > 0) {
       const market = this.exchange.markets[symbol];
       const minCost = Number(market?.limits?.cost?.min || 0);
-      const precisePrice = Number(this.exchange.priceToPrecision(symbol, sellPrice));
-      const preciseAmount = Number(this.exchange.amountToPrecision(symbol, sellableAmount));
-      const notional = preciseAmount * precisePrice;
+      const { notional } = this.getPreciseOrderNumbers(symbol, sellPrice, sellableAmount);
       if (minCost > 0 && notional < minCost - 1e-8) {
         console.warn(
           `[SKIP] ${symbol} SELL refill level=${levelIndex + 1} | notional ${notional.toFixed(8)} below min ${minCost}, keeping buy record for later retry`
@@ -1809,6 +1843,10 @@ class SpotGridEngine {
     
     if (GRID_REFILL_ON_FILLED && aiDecision.allowTrading && aiDecision.allowBuy && levelIndex - 1 >= 0) {
       const buyPrice = levels[levelIndex - 1];
+      if (this.hasActiveOrderAtLevel(symState, 'buy', levelIndex - 1)) {
+        console.warn(`[SKIP] ${symbol} BUY refill level=${levelIndex - 1} | buy order already active`);
+        return;
+      }
       let amountToBuy = this.amountForBuy(symbol, buyPrice);
       let cost = amountToBuy * buyPrice;
       if (!(amountToBuy > 0)) {
@@ -1824,6 +1862,14 @@ class SpotGridEngine {
           console.warn(`[SKIP] ${symbol} BUY refill level=${levelIndex - 1} | cannot meet min notional ${minCost}`);
           return;
         }
+      }
+      const remainingInvestmentUsdt = this.getRemainingInvestmentUsdt(symbol);
+      const precise = this.getPreciseOrderNumbers(symbol, buyPrice, amountToBuy);
+      if (precise.notional > remainingInvestmentUsdt + 1e-8) {
+        console.warn(
+          `[SKIP] ${symbol} BUY refill level=${levelIndex - 1} | rounded cost ${precise.notional.toFixed(8)} exceeds remaining investment ${roundNumber(remainingInvestmentUsdt, 8)}`
+        );
+        return;
       }
       await this.placeLimit(symbol, 'buy', levelIndex - 1, buyPrice, amountToBuy);
     }
@@ -2038,12 +2084,20 @@ class SpotGridEngine {
           break;
         }
       }
-      
+
+      const precise = this.getPreciseOrderNumbers(symbol, level.price, amount);
+      cost = precise.notional;
+      if (cost > remainingInvestmentUsdt + 1e-8) {
+        console.warn(
+          `[SKIP] ${symbol} BUY level=${level.index} | rounded cost ${cost.toFixed(8)} exceeds remaining investment ${roundNumber(remainingInvestmentUsdt, 8)}`
+        );
+        break;
+      }
       if (quoteFree < cost) break;
       const order = await this.placeLimit(symbol, 'buy', level.index, level.price, amount);
       if (!order) break;
       quoteFree -= cost;
-      remainingInvestmentUsdt -= cost;
+      remainingInvestmentUsdt = Math.max(0, remainingInvestmentUsdt - cost);
     }
 
     for (const level of above) {

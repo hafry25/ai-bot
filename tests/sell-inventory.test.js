@@ -105,3 +105,50 @@ test('handleSellFill guards zero sellable buy records', async () => {
   assert.equal(symState.lastBuyByLevel[4].sellableAmount, 0);
   assert.equal(saved, 1);
 });
+
+test('handleBuyFill skips refill sell when sell level is already active', async () => {
+  const symState = {
+    orders: {
+      buyOrder: { side: 'buy', levelIndex: 4 },
+      sellOrder: { side: 'sell', levelIndex: 5 },
+    },
+    lastBuyByLevel: {},
+  };
+  let placed = false;
+  const engine = Object.create(SpotGridEngine.prototype);
+  engine.exchange = {
+    markets: {
+      'BONK/USDT': { limits: { cost: { min: 0 } } },
+    },
+    priceToPrecision: (_symbol, price) => String(price),
+    amountToPrecision: (_symbol, amount) => String(amount),
+  };
+  engine.state = {
+    data: {
+      totals: {
+        filledBuys: 0,
+      },
+    },
+    save: () => {},
+    markProcessedTrade: () => {},
+  };
+  engine.sendAlert = async () => {};
+  engine.placeLimit = async () => {
+    placed = true;
+  };
+
+  await engine.handleBuyFill(
+    'BONK/USDT',
+    [1, 2, 3, 4, 5, 6],
+    { allowTrading: true, allowSell: true },
+    symState,
+    { id: 'trade-1', order: 'buyOrder', price: 4, amount: 10, datetime: '2026-01-01T00:00:00.000Z', fee: { cost: 0, currency: 'USDT' } },
+    { levelIndex: 4 },
+    new Set(['sellOrder'])
+  );
+
+  assert.equal(placed, false);
+  assert.equal(symState.orders.buyOrder, undefined);
+  assert.equal(symState.orders.sellOrder.levelIndex, 5);
+  assert.equal(symState.lastBuyByLevel[4].sellableAmount, 10);
+});
