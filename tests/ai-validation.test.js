@@ -61,6 +61,65 @@ test('AI validation reuses the last decision during the minimum interval', async
   assert.equal(modelCalls, 1);
 });
 
+test('AI validation refreshes cache after learning memory adjusts confidence', async () => {
+  AIGridValidator.lastDecisionBySymbol.clear();
+  AIGridValidator.cache.clear();
+  AIGridValidator.rateLimitedUntil = 0;
+
+  const cachedValues = [];
+  const validator = Object.create(AIGridValidator.prototype);
+  validator.exchange = {
+    fetchOHLCV: async () => [
+      [1, 100, 101, 99, 100, 10],
+      [2, 100, 102, 99, 101, 10],
+    ],
+  };
+  validator.model = {
+    generateContent: async () => ({
+      response: {
+        text: () => JSON.stringify({
+          allowTrading: true,
+          allowBuy: true,
+          allowSell: true,
+          confidence: 80,
+          reason: 'ok',
+        }),
+      },
+    }),
+  };
+  validator.getCached = () => null;
+  validator.setCached = (_key, value) => {
+    cachedValues.push({ ...value });
+  };
+  validator.learningMemory = {
+    enrichContext: () => ({ currentPrice: 100 }),
+    querySimilarWithFeatures: () => ({
+      samples: 5,
+      weightedRatio: 1,
+      ratio: 1,
+      weightedSamples: 5,
+      closestDistance: 0,
+    }),
+    recordDecision: () => {},
+  };
+
+  const context = {
+    currentPrice: 100,
+    lower: 90,
+    upper: 110,
+    levels: [90, 100, 110],
+  };
+
+  const decision = await validator.validate('BTC/USDT', context);
+  const remembered = AIGridValidator.lastDecisionBySymbol.get('BTC/USDT').value;
+
+  assert.equal(cachedValues.length, 2);
+  assert.equal(cachedValues.at(-1).confidence, 92);
+  assert.equal(decision.confidence, 92);
+  assert.equal(remembered.confidence, 92);
+  assert.match(decision.reason, /Memory: 100% weighted success/);
+});
+
 test('LearningMemory weighting favors recent outcomes', () => {
   const memory = Object.create(LearningMemory.prototype);
   memory.enabled = true;

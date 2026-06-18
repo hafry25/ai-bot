@@ -57,6 +57,7 @@ node index.js
 - `SYMBOLS`: daftar pair dipisah koma, misalnya `BTC/USDT,ETH/USDT`
 - `GRID_LOWER_PRICE` dan `GRID_UPPER_PRICE`: range manual
 - `GRID_RANGE_PCT`: dipakai kalau range manual tidak diisi
+- `GRID_RESET_RANGE_ON_START`: hitung ulang auto range dari harga saat start, bukan memakai range yang tersimpan
 - `GRID_ORDER_SIZE_USDT` atau `GRID_TOTAL_INVESTMENT_USDT`: pilih salah satu untuk ukuran modal
 - `AI_VALIDATION_ENABLED`: aktifkan jika ingin bot meminta validasi Gemini
 - `LEARNING_MEMORY_ENABLED`: aktifkan jika ingin bot menyimpan dan memakai histori keputusan

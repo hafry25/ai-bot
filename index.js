@@ -64,6 +64,7 @@ const GRID_MODE = Config.get('GRID_MODE', 'ARITHMETIC').toUpperCase();
 const GRID_LOWER_PRICE = Config.number('GRID_LOWER_PRICE', 0);
 const GRID_UPPER_PRICE = Config.number('GRID_UPPER_PRICE', 0);
 const GRID_RANGE_PCT = Config.number('GRID_RANGE_PCT', 5);
+const GRID_RESET_RANGE_ON_START = Config.boolean('GRID_RESET_RANGE_ON_START', false);
 const GRID_TRAILING_RANGE_ENABLED = Config.boolean('GRID_TRAILING_RANGE_ENABLED', false);
 const GRID_TRAILING_UP_ENABLED = Config.boolean('GRID_TRAILING_UP_ENABLED', GRID_TRAILING_RANGE_ENABLED);
 const GRID_TRAILING_UP_COOLDOWN_MS = Math.max(Config.number('GRID_TRAILING_UP_COOLDOWN_MINUTES', 0), 0) * MINUTE_MS;
@@ -325,42 +326,44 @@ class ProcessLock {
   }
 
   acquire() {
-    const lockMissing = this.assertLockCanBeAcquired();
-    if (!lockMissing) {
-      const owner = this.readOwner();
-      throw new Error(`Bot already running with PID ${owner.pid}. Lock: ${this.lockPath}`);
-    }
-
-    // Try to create the lock file
-    try {
-      this.fd = fs.openSync(this.lockPath, 'wx');
-      this.ownerToken = crypto.randomUUID();
-      fs.writeFileSync(this.fd, JSON.stringify({
-        pid: process.pid,
-        token: this.ownerToken,
-        acquiredAt: new Date().toISOString(),
-      }));
-      fs.fsyncSync(this.fd);
-      if (!this.ownsLock()) {
-        fs.closeSync(this.fd);
-        this.fd = null;
-        this.ownerToken = null;
-        throw new Error(`Lost bot lock during acquisition: ${this.lockPath}`);
-      }
-      console.log(`[LOCK] Acquired lock ${this.lockPath} for PID ${process.pid}`);
-      return;
-    } catch (err) {
-      if (err.code !== 'EEXIST') throw err;
-      const owner = this.readOwner();
-      if (this.removeMalformedLock(owner)) return this.acquire();
-      if (this.processIsAlive(owner.pid)) {
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const lockMissing = this.assertLockCanBeAcquired();
+      if (!lockMissing) {
+        const owner = this.readOwner();
         throw new Error(`Bot already running with PID ${owner.pid}. Lock: ${this.lockPath}`);
       }
-      throw new Error(
-        `Stale bot lock found for PID ${owner.pid}. ` +
-        `Inspect ${this.lockPath} and remove it manually if no bot is running.`
-      );
+
+      try {
+        this.fd = fs.openSync(this.lockPath, 'wx');
+        this.ownerToken = crypto.randomUUID();
+        fs.writeFileSync(this.fd, JSON.stringify({
+          pid: process.pid,
+          token: this.ownerToken,
+          acquiredAt: new Date().toISOString(),
+        }));
+        fs.fsyncSync(this.fd);
+        if (!this.ownsLock()) {
+          fs.closeSync(this.fd);
+          this.fd = null;
+          this.ownerToken = null;
+          throw new Error(`Lost bot lock during acquisition: ${this.lockPath}`);
+        }
+        console.log(`[LOCK] Acquired lock ${this.lockPath} for PID ${process.pid}`);
+        return;
+      } catch (err) {
+        if (err.code !== 'EEXIST') throw err;
+        const owner = this.readOwner();
+        if (this.removeMalformedLock(owner)) continue;
+        if (this.processIsAlive(owner.pid)) {
+          throw new Error(`Bot already running with PID ${owner.pid}. Lock: ${this.lockPath}`);
+        }
+        throw new Error(
+          `Stale bot lock found for PID ${owner.pid}. ` +
+          `Inspect ${this.lockPath} and remove it manually if no bot is running.`
+        );
+      }
     }
+    throw new Error(`Unable to acquire bot lock after repeated malformed-lock cleanup: ${this.lockPath}`);
   }
 
   release() {
@@ -1052,6 +1055,8 @@ Be conservative. Protect capital first.
           );
         }
         this.learningMemory.recordDecision(symbol, context, decision, profit);
+        this.setCached(cacheKey, decision);
+        this.rememberDecision(symbol, decision);
       }
       // ------------------------------------
 
@@ -1079,6 +1084,7 @@ class SpotGridEngine {
     this.isRunning = false;
     this.symbolLocks = new Map();
     this.pendingOrderLevels = new Set();
+    this.rangeResetSymbols = new Set();
     this.circuitBreaker = { errors: 0, pausedUntil: 0 };
   }
 
@@ -1135,12 +1141,15 @@ class SpotGridEngine {
   buildRange(symbol, currentPrice) {
     const symState = this.state.getSymbol(symbol);
     const manualRange = hasManualGridRange();
+    const resetAutoRange = !manualRange &&
+      GRID_RESET_RANGE_ON_START &&
+      !(this.rangeResetSymbols && this.rangeResetSymbols.has(symbol));
     const lower = manualRange
       ? GRID_LOWER_PRICE
-      : Number(symState.config.lower || currentPrice * (1 - GRID_RANGE_PCT / 100));
+      : Number((resetAutoRange ? 0 : symState.config.lower) || currentPrice * (1 - GRID_RANGE_PCT / 100));
     const upper = manualRange
       ? GRID_UPPER_PRICE
-      : Number(symState.config.upper || currentPrice * (1 + GRID_RANGE_PCT / 100));
+      : Number((resetAutoRange ? 0 : symState.config.upper) || currentPrice * (1 + GRID_RANGE_PCT / 100));
     if (lower <= 0 || upper <= 0 || lower >= upper) {
       throw new Error(`Invalid grid range. lower=${lower}, upper=${upper}`);
     }
@@ -1152,6 +1161,10 @@ class SpotGridEngine {
       autoRange: !manualRange,
       orderSizeUsdt: this.getOrderSizeUsdt(),
     };
+    if (resetAutoRange) {
+      if (!this.rangeResetSymbols) this.rangeResetSymbols = new Set();
+      this.rangeResetSymbols.add(symbol);
+    }
     this.state.save();
     return { lower, upper };
   }
@@ -1644,12 +1657,14 @@ class SpotGridEngine {
     
     if (GRID_REFILL_ON_FILLED && aiDecision.allowTrading && aiDecision.allowBuy && levelIndex - 1 >= 0) {
       const buyPrice = levels[levelIndex - 1];
-      const orderSizeUsdt = this.getOrderSizeUsdt();
-      const newBuyAmount = orderSizeUsdt / buyPrice;
+      let amountToBuy = this.amountForBuy(symbol, buyPrice);
+      let cost = amountToBuy * buyPrice;
+      if (!(amountToBuy > 0)) {
+        console.warn(`[SKIP] ${symbol} BUY refill level=${levelIndex - 1} | investment cap reached`);
+        return;
+      }
       const market = this.exchange.markets[symbol];
       const minCost = Number(market?.limits?.cost?.min || 0);
-      let amountToBuy = newBuyAmount;
-      let cost = amountToBuy * buyPrice;
       if (minCost > 0 && cost < minCost - 1e-8) {
         amountToBuy = minCost / buyPrice;
         cost = amountToBuy * buyPrice;
@@ -1848,12 +1863,17 @@ class SpotGridEngine {
 
     let quoteFree = this.getQuoteFree(balance, symbol);
     let baseFree = this.getBaseFree(balance, symbol);
+    let remainingInvestmentUsdt = this.getRemainingInvestmentUsdt(symbol);
 
     for (const level of below) {
       if (!aiDecision.allowTrading || !aiDecision.allowBuy) break;
       if (activeBuyLevels.has(level.index)) continue;
-      let amount = this.amountForBuy(symbol, level.price);
+      let amount = this.amountForBuy(symbol, level.price, remainingInvestmentUsdt);
       let cost = amount * level.price;
+      if (!(amount > 0)) {
+        console.warn(`[SKIP] ${symbol} BUY level=${level.index} | investment cap reached`);
+        break;
+      }
       
       const market = this.exchange.markets[symbol];
       const minCost = Number(market?.limits?.cost?.min || 0);
@@ -1871,6 +1891,7 @@ class SpotGridEngine {
       const order = await this.placeLimit(symbol, 'buy', level.index, level.price, amount);
       if (!order) break;
       quoteFree -= cost;
+      remainingInvestmentUsdt -= cost;
     }
 
     for (const level of above) {
@@ -1910,10 +1931,32 @@ class SpotGridEngine {
     return Math.max(0, Number(buy.sellableAmount ?? buy.amount) || 0);
   }
 
-  amountForBuy(symbol, price) {
+  getAllocatedInvestmentUsdt(symbol) {
+    if (!(GRID_TOTAL_INVESTMENT_USDT > 0)) return 0;
+    const symState = this.state.getSymbol(symbol);
+    let allocated = 0;
+    for (const buy of Object.values(symState.lastBuyByLevel)) {
+      allocated += Number(buy.totalCostQuote) || 0;
+    }
+    for (const order of Object.values(symState.orders)) {
+      if (String(order.side).toLowerCase() !== 'buy') continue;
+      allocated += (Number(order.amount) || 0) * (Number(order.price) || 0);
+    }
+    return allocated;
+  }
+
+  getRemainingInvestmentUsdt(symbol) {
+    if (!(GRID_TOTAL_INVESTMENT_USDT > 0)) return Infinity;
+    return Math.max(0, GRID_TOTAL_INVESTMENT_USDT - this.getAllocatedInvestmentUsdt(symbol));
+  }
+
+  amountForBuy(symbol, price, availableInvestmentUsdt = this.getRemainingInvestmentUsdt(symbol)) {
     const market = this.exchange.markets[symbol];
     const minCost = Number(market?.limits?.cost?.min || 0);
-    const notional = Math.max(this.getOrderSizeUsdt(), minCost);
+    const targetNotional = Math.max(this.getOrderSizeUsdt(), minCost);
+    const notional = Math.min(targetNotional, availableInvestmentUsdt);
+    if (minCost > 0 && notional < minCost - 1e-8) return 0;
+    if (!(notional > 0)) return 0;
     return notional / price;
   }
 
