@@ -173,8 +173,13 @@ const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 function sleepSync(ms) {
   if (!(ms > 0)) return;
   // Used only during startup lock acquisition, before the bot begins its async work.
-  const buffer = new SharedArrayBuffer(4);
-  Atomics.wait(new Int32Array(buffer), 0, 0, ms);
+  try {
+    const buffer = new SharedArrayBuffer(4);
+    Atomics.wait(new Int32Array(buffer), 0, 0, ms);
+  } catch {
+    const until = Date.now() + ms;
+    while (Date.now() < until) {}
+  }
 }
 
 async function withTimeout(promise, timeoutMs, message) {
@@ -348,7 +353,8 @@ class ProcessLock {
   }
 
   removeMalformedLock(owner) {
-    if (!owner?.malformed || this.processIsAlive(owner.pid)) return false;
+    if (!owner?.malformed) return false;
+    if (owner.pid && this.processIsAlive(owner.pid)) return false;
     try {
       fs.unlinkSync(this.lockPath);
       console.warn(`[LOCK] Removed malformed stale lock ${this.lockPath}`);
@@ -504,6 +510,7 @@ class ExchangeManager {
 class GridState {
   constructor() {
     this.data = this.load();
+    this.rebuildProcessedTradeIndex();
   }
 
   static createEmpty() {
@@ -540,6 +547,10 @@ class GridState {
       console.warn('[STATE] Failed to read grid state, starting fresh:', err.message);
     }
     return GridState.createEmpty();
+  }
+
+  rebuildProcessedTradeIndex() {
+    this.processedTradeIdSet = new Set(this.data.processedTradeIds);
   }
 
   save() {
@@ -594,15 +605,19 @@ class GridState {
   processedTrade(symbol, id) {
     const scopedId = scopedTradeId(symbol, id);
     const legacyId = String(id);
-    return this.data.processedTradeIds.includes(scopedId) ||
-      this.data.processedTradeIds.includes(legacyId);
+    return this.processedTradeIdSet.has(scopedId) ||
+      this.processedTradeIdSet.has(legacyId);
   }
 
   markProcessedTrade(symbol, id) {
     const scopedId = scopedTradeId(symbol, id);
     if (this.processedTrade(symbol, id)) return false;
     this.data.processedTradeIds.push(scopedId);
+    this.processedTradeIdSet.add(scopedId);
     this.data.processedTradeIds = this.data.processedTradeIds.slice(-MAX_PROCESSED_TRADE_IDS);
+    if (this.data.processedTradeIds.length >= MAX_PROCESSED_TRADE_IDS) {
+      this.rebuildProcessedTradeIndex();
+    }
     this.save();
     return true;
   }
@@ -1784,31 +1799,17 @@ class SpotGridEngine {
     const costQuote = price * amount;
     const feeQuote = this.feeToQuote(feeCost, feeCurrency, price, base, quote);
     
-    const existing = symState.lastBuyByLevel[levelIndex];
-    if (existing) {
-      const totalAmount = existing.amount + amount;
-      const totalSellable = (existing.sellableAmount ?? existing.amount) + sellableAmount;
-      const totalCostQuote = existing.totalCostQuote + costQuote;
-      const totalFeeQuote = existing.totalFeeQuote + feeQuote;
-      const avgPrice = totalCostQuote / totalAmount;
-      symState.lastBuyByLevel[levelIndex] = {
-        price: avgPrice,
-        amount: totalAmount,
-        sellableAmount: totalSellable,
-        totalCostQuote: totalCostQuote,
-        totalFeeQuote: totalFeeQuote,
-        at: trade.datetime,
-      };
-    } else {
-      symState.lastBuyByLevel[levelIndex] = {
+    symState.lastBuyByLevel[levelIndex] = this.mergeBuyRecords(
+      symState.lastBuyByLevel[levelIndex],
+      {
         price,
         amount,
         sellableAmount,
         totalCostQuote: costQuote,
         totalFeeQuote: feeQuote,
         at: trade.datetime,
-      };
-    }
+      }
+    );
     
     this.state.data.totals.filledBuys++;
     this.state.save();
@@ -1955,6 +1956,9 @@ class SpotGridEngine {
       allTrades = allTrades.concat(trades);
       const lastTimestamp = trades[trades.length - 1].timestamp;
       if (trades.length < TRADE_FETCH_LIMIT) break;
+      // CCXT pagination is timestamp-based here; if many fills share one timestamp,
+      // processedTrade() handles duplicates but the exchange may not expose a stable
+      // cursor for every trade in that timestamp bucket.
       if (lastTimestamp === from) break;
       from = lastTimestamp + 1;
       iteration++;
@@ -1962,7 +1966,7 @@ class SpotGridEngine {
     }
     if (allTrades.length) {
       const maxTs = Math.max(...allTrades.map(t => t.timestamp));
-      symState.lastTradeTimestamp = maxTs + 1;
+      symState.lastTradeTimestamp = maxTs;
       this.state.save();
     }
     return allTrades;
