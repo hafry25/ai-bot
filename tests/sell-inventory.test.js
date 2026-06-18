@@ -54,3 +54,54 @@ test('placeLimit skips invalid dust amounts and clears pending level', async () 
   assert.equal(order, null);
   assert.equal(engine.pendingOrderLevels.size, 0);
 });
+
+test('handleSellFill guards zero sellable buy records', async () => {
+  const symState = {
+    orders: {
+      sellOrder: { levelIndex: 5 },
+    },
+    lastBuyByLevel: {
+      4: {
+        amount: 0,
+        sellableAmount: 0,
+        totalCostQuote: 0,
+        totalFeeQuote: 0,
+      },
+    },
+    realizedGridProfit: 0,
+  };
+  let saved = 0;
+  let processedTradeId = null;
+  const engine = Object.create(SpotGridEngine.prototype);
+  engine.state = {
+    data: {
+      totals: {
+        realizedGridProfit: 0,
+        filledSells: 0,
+      },
+    },
+    markProcessedTrade: (_symbol, id) => {
+      processedTradeId = id;
+    },
+    save: () => {
+      saved++;
+    },
+  };
+
+  await engine.handleSellFill(
+    'BONK/USDT',
+    [],
+    {},
+    symState,
+    { id: 'trade-1', order: 'sellOrder', price: 10, amount: 1, fee: { cost: 0, currency: 'USDT' } },
+    { levelIndex: 5 },
+    new Set()
+  );
+
+  assert.equal(processedTradeId, 'trade-1');
+  assert.equal(symState.realizedGridProfit, 0);
+  assert.equal(engine.state.data.totals.filledSells, 0);
+  assert.equal(symState.orders.sellOrder, undefined);
+  assert.equal(symState.lastBuyByLevel[4].sellableAmount, 0);
+  assert.equal(saved, 1);
+});

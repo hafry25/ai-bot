@@ -179,3 +179,21 @@ test('LearningMemory weighting favors recent outcomes', () => {
   assert.ok(result.ratio > result.weightedRatio);
   assert.equal(typeof result.closestDistance, 'number');
 });
+
+test('AI validation cache evicts least recently used non-expired entry', () => {
+  AIGridValidator.cache.clear();
+  AIGridValidator.MAX_CACHE_SIZE = 2;
+  const validator = Object.create(AIGridValidator.prototype);
+
+  validator.setCached('old', { reason: 'old' });
+  validator.setCached('recent', { reason: 'recent' });
+  assert.equal(validator.getCached('old').reason, 'old');
+  validator.setCached('new', { reason: 'new' });
+
+  assert.equal(validator.getCached('recent'), null);
+  assert.equal(validator.getCached('old').reason, 'old');
+  assert.equal(validator.getCached('new').reason, 'new');
+
+  AIGridValidator.cache.clear();
+  AIGridValidator.MAX_CACHE_SIZE = 100;
+});

@@ -76,3 +76,41 @@ test('trailing-up follows a large move by shifting multiple grids', async () => 
   assert.deepEqual(Object.keys(symbolState.lastBuyByLevel), ['1']);
   assert.equal(symbolState.trailingUp.shifts, 3);
 });
+
+test('trailing-up aborts state shift when order cancellation fails', async () => {
+  const symbolState = {
+    config: { lower: 90, upper: 110 },
+    orders: {
+      buy: { levelIndex: 2 },
+    },
+    lastBuyByLevel: {
+      4: { amount: 2 },
+    },
+    trailingUp: { shifts: 0, lastShiftAt: null },
+  };
+  const engine = Object.create(SpotGridEngine.prototype);
+  engine.state = {
+    getSymbol: () => symbolState,
+    save: () => {
+      throw new Error('state must not be saved');
+    },
+  };
+  engine.cancelGridOrders = async () => ({
+    cancelled: [],
+    failed: [{ id: 'order-1', error: new Error('network') }],
+  });
+  engine.sendAlert = async () => {
+    throw new Error('alert must not be sent');
+  };
+
+  await assert.rejects(
+    () => engine.applyTrailingRangeShift('BTC/USDT', 90, 110, { lower: 92, upper: 112, steps: 1 }, 'up'),
+    /failed to cancel grid orders: order-1/
+  );
+
+  assert.equal(symbolState.config.lower, 90);
+  assert.equal(symbolState.config.upper, 110);
+  assert.equal(symbolState.orders.buy.levelIndex, 2);
+  assert.deepEqual(Object.keys(symbolState.lastBuyByLevel), ['4']);
+  assert.equal(symbolState.trailingUp.shifts, 0);
+});

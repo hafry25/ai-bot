@@ -656,23 +656,46 @@ class LearningMemory {
   }
 
   similarity(f1, f2) {
-    const features = [
-      { a: f1.rangePct, b: f2.rangePct, min: 0, max: 20 },
-      { a: f1.distLower, b: f2.distLower, min: -20, max: 20 },
-      { a: f1.distUpper, b: f2.distUpper, min: -20, max: 20 },
-      { a: f1.positionPct, b: f2.positionPct, min: 0, max: 100 },
-      { a: f1.changePct, b: f2.changePct, min: -20, max: 20 },
-      { a: f1.volumeRatio, b: f2.volumeRatio, min: 0, max: 10 },
-      { a: f1.trailingUp, b: f2.trailingUp, min: 0, max: 1 },
-      { a: f1.trailingDown, b: f2.trailingDown, min: 0, max: 1 },
+    return this.similarityWithScales(f1, f2, this.defaultSimilarityScales());
+  }
+
+  defaultSimilarityScales() {
+    return [
+      { key: 'rangePct', min: 0, max: 20 },
+      { key: 'distLower', min: -20, max: 20 },
+      { key: 'distUpper', min: -20, max: 20 },
+      { key: 'positionPct', min: 0, max: 100 },
+      { key: 'changePct', min: -20, max: 20 },
+      { key: 'volumeRatio', min: 0, max: 10 },
+      { key: 'trailingUp', min: 0, max: 1 },
+      { key: 'trailingDown', min: 0, max: 1 },
     ];
+  }
+
+  buildSimilarityScales(features, candidates) {
+    return this.defaultSimilarityScales().map(scale => {
+      const values = [features?.[scale.key], ...candidates.map(r => r.context?.[scale.key])]
+        .map(Number)
+        .filter(Number.isFinite);
+      if (values.length < 2) return scale;
+      const min = Math.min(...values);
+      const max = Math.max(...values);
+      if (max - min <= Number.EPSILON) return scale;
+      return { ...scale, min, max };
+    });
+  }
+
+  similarityWithScales(f1, f2, scales) {
     let sumSq = 0;
-    for (const f of features) {
-      const na = (f.a - f.min) / (f.max - f.min);
-      const nb = (f.b - f.min) / (f.max - f.min);
+    for (const f of scales) {
+      const denom = f.max - f.min;
+      const a = Number(f1?.[f.key]) || 0;
+      const b = Number(f2?.[f.key]) || 0;
+      const na = denom > 0 ? (a - f.min) / denom : 0;
+      const nb = denom > 0 ? (b - f.min) / denom : 0;
       sumSq += (na - nb) ** 2;
     }
-    return Math.sqrt(sumSq / features.length);
+    return Math.sqrt(sumSq / scales.length);
   }
 
   similarityWeight(distance) {
@@ -694,8 +717,9 @@ class LearningMemory {
     );
     if (candidates.length < LEARNING_MEMORY_MIN_SAMPLES) return null;
 
+    const scales = this.buildSimilarityScales(features, candidates);
     const scored = candidates.map(r => {
-      const dist = this.similarity(features, r.context);
+      const dist = this.similarityWithScales(features, r.context, scales);
       const similarityWeight = this.similarityWeight(dist);
       const recencyWeight = this.recencyWeight(r.timestamp);
       return {
@@ -832,17 +856,26 @@ class AIGridValidator {
 
   getCached(key) {
     const entry = AIGridValidator.cache.get(key);
-    if (entry && entry.expiresAt > Date.now()) return entry.value;
+    if (entry && entry.expiresAt > Date.now()) {
+      AIGridValidator.cache.delete(key);
+      AIGridValidator.cache.set(key, entry);
+      return entry.value;
+    }
     if (entry) AIGridValidator.cache.delete(key);
     return null;
   }
 
   setCached(key, value) {
-    if (AIGridValidator.cache.size >= AIGridValidator.MAX_CACHE_SIZE) {
-      const oldest = AIGridValidator.cache.keys().next().value;
-      AIGridValidator.cache.delete(oldest);
+    const now = Date.now();
+    for (const [cachedKey, entry] of AIGridValidator.cache.entries()) {
+      if (!entry || entry.expiresAt <= now) AIGridValidator.cache.delete(cachedKey);
     }
-    AIGridValidator.cache.set(key, { value, expiresAt: Date.now() + AI_VALIDATION_CACHE_TTL_MS });
+    if (AIGridValidator.cache.has(key)) AIGridValidator.cache.delete(key);
+    if (AIGridValidator.cache.size >= AIGridValidator.MAX_CACHE_SIZE) {
+      const leastRecentlyUsed = AIGridValidator.cache.keys().next().value;
+      AIGridValidator.cache.delete(leastRecentlyUsed);
+    }
+    AIGridValidator.cache.set(key, { value, expiresAt: now + AI_VALIDATION_CACHE_TTL_MS });
   }
 
   getLastDecisionEntry(symbol, allowStale = false) {
@@ -1259,7 +1292,11 @@ class SpotGridEngine {
 
   async applyTrailingRangeShift(symbol, lower, upper, shift, direction) {
     // 1. Cancel existing grid orders first (so we don't leave stale orders if something fails)
-    await this.cancelGridOrders(symbol, `trailing-${direction}`);
+    const cancelResult = await this.cancelGridOrders(symbol, `trailing-${direction}`);
+    if (cancelResult.failed.length > 0) {
+      const failedIds = cancelResult.failed.map(failure => failure.id).join(', ');
+      throw new Error(`Trailing ${direction} shift aborted; failed to cancel grid orders: ${failedIds}`);
+    }
 
     // 2. Now update state
     const symState = this.state.getSymbol(symbol);
@@ -1403,18 +1440,22 @@ class SpotGridEngine {
   }
 
   async cancelGridOrders(symbol, reason) {
-    if (!this.exchange?.fetchOpenOrders || !this.exchange?.cancelOrder) return;
+    const result = { cancelled: [], failed: [] };
+    if (!this.exchange?.fetchOpenOrders || !this.exchange?.cancelOrder) return result;
     const openOrders = await retry(() => this.exchange.fetchOpenOrders(symbol));
     const managed = this.getManagedOpenOrders(symbol, openOrders);
     for (const order of managed) {
       try {
         await retry(() => this.exchange.cancelOrder(order.id, symbol));
         this.state.forgetOrder(symbol, order.id);
+        result.cancelled.push(String(order.id));
         console.log(`[CANCEL] ${symbol} ${order.side} ${order.id} | ${reason}`);
       } catch (err) {
+        result.failed.push({ id: String(order.id), error: err });
         console.warn(`[CANCEL] Failed to cancel ${symbol} order ${order.id}: ${err.message}`);
       }
     }
+    return result;
   }
 
   async cancelOrder(symbol, order, reason) {
@@ -1632,6 +1673,12 @@ class SpotGridEngine {
     
     const totalBuyAmount = buy.amount;
     const sellableAtBuy = buy.sellableAmount ?? totalBuyAmount;
+    if (!(sellableAtBuy > 0)) {
+      console.warn(`[SELL] ${symbol} level ${levelIndex} buy record has zero sellable amount. Skipping profit calculation.`);
+      this.forgetOrderIfClosed(symState, trade, openOrderIds);
+      this.state.markProcessedTrade(symbol, this.getTradeId(trade));
+      return;
+    }
     const proportion = Math.min(amount / sellableAtBuy, 1.0);
     const allocatedBuyCost = buy.totalCostQuote * proportion;
     const allocatedBuyFee = buy.totalFeeQuote * proportion;
@@ -1908,10 +1955,7 @@ class SpotGridEngine {
       const minCost = Number(market?.limits?.cost?.min || 0);
       const notional = amount * level.price;
       if (minCost > 0 && notional < minCost - 1e-8) {
-        console.warn(`[SKIP] ${symbol} SELL level=${level.index} | notional too low (dust), deleting corresponding buy`);
-        const symState = this.state.getSymbol(symbol);
-        delete symState.lastBuyByLevel[level.index - 1];
-        this.state.save();
+        console.warn(`[SKIP] ${symbol} SELL level=${level.index} | notional too low (dust), keeping buy record for later retry`);
         continue;
       }
       
