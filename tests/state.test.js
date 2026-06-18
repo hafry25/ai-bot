@@ -117,7 +117,7 @@ test('ProcessLock release does not delete a replacement lock owned by the same P
   }
 });
 
-test('ProcessLock fails closed instead of deleting a stale lock', () => {
+test('ProcessLock removes a confirmed stale lock before acquiring', () => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'grid-lock-'));
   const lockPath = path.join(directory, 'bot.lock');
   fs.writeFileSync(lockPath, JSON.stringify({ pid: 100, token: 'stale' }));
@@ -125,9 +125,13 @@ test('ProcessLock fails closed instead of deleting a stale lock', () => {
   lock.processIsAlive = () => false;
 
   try {
-    assert.throws(() => lock.acquire(), /Stale bot lock found for PID 100/);
+    lock.acquire();
     assert.equal(fs.existsSync(lockPath), true);
+    const owner = JSON.parse(fs.readFileSync(lockPath, 'utf8'));
+    assert.equal(owner.pid, process.pid);
+    assert.equal(typeof owner.token, 'string');
   } finally {
+    lock.release();
     fs.rmSync(directory, { recursive: true, force: true });
   }
 });

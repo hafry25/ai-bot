@@ -106,6 +106,57 @@ test('handleSellFill guards zero sellable buy records', async () => {
   assert.equal(saved, 1);
 });
 
+test('handleSellFill does not fall back to a same-level buy record', async () => {
+  const symState = {
+    orders: {
+      sellOrder: { levelIndex: 5 },
+    },
+    lastBuyByLevel: {
+      5: {
+        amount: 1,
+        sellableAmount: 1,
+        totalCostQuote: 5,
+        totalFeeQuote: 0,
+      },
+    },
+    realizedGridProfit: 0,
+  };
+  let processedTradeId = null;
+  const engine = Object.create(SpotGridEngine.prototype);
+  engine.state = {
+    data: {
+      totals: {
+        realizedGridProfit: 0,
+        filledSells: 0,
+      },
+    },
+    markProcessedTrade: (_symbol, id) => {
+      processedTradeId = id;
+    },
+    save: () => {},
+  };
+
+  await engine.handleSellFill(
+    'BONK/USDT',
+    [],
+    {},
+    symState,
+    { id: 'trade-1', order: 'sellOrder', price: 10, amount: 1, fee: { cost: 0, currency: 'USDT' } },
+    { levelIndex: 5 },
+    new Set()
+  );
+
+  assert.equal(processedTradeId, 'trade-1');
+  assert.equal(symState.realizedGridProfit, 0);
+  assert.equal(engine.state.data.totals.filledSells, 0);
+  assert.deepEqual(symState.lastBuyByLevel[5], {
+    amount: 1,
+    sellableAmount: 1,
+    totalCostQuote: 5,
+    totalFeeQuote: 0,
+  });
+});
+
 test('handleBuyFill skips refill sell when sell level is already active', async () => {
   const symState = {
     orders: {

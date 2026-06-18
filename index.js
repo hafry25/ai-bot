@@ -145,6 +145,7 @@ const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 
 function sleepSync(ms) {
   if (!(ms > 0)) return;
+  // Used only during startup lock acquisition, before the bot begins its async work.
   const buffer = new SharedArrayBuffer(4);
   Atomics.wait(new Int32Array(buffer), 0, 0, ms);
 }
@@ -377,7 +378,7 @@ class ProcessLock {
       try {
         this.fd = fs.openSync(this.lockPath, 'wx');
         this.ownerToken = crypto.randomUUID();
-        fs.writeFileSync(this.fd, JSON.stringify({
+        fs.writeSync(this.fd, JSON.stringify({
           pid: process.pid,
           token: this.ownerToken,
           acquiredAt: new Date().toISOString(),
@@ -1792,7 +1793,7 @@ class SpotGridEngine {
     const price = Number(trade.price);
     const amount = Number(trade.amount);
     const levelIndex = Number(orderMeta.levelIndex);
-    const buyLevelIndex = symState.lastBuyByLevel[levelIndex - 1] ? levelIndex - 1 : levelIndex;
+    const buyLevelIndex = levelIndex - 1;
     const buy = symState.lastBuyByLevel[buyLevelIndex];
     if (!buy) {
       console.warn(`[SELL] ${symbol} level ${levelIndex} has no corresponding buy record. Skipping profit calculation.`);
