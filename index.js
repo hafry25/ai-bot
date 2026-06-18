@@ -598,13 +598,13 @@ class LearningMemory {
     };
   }
 
-  recordDecision(symbol, context, decision, profit = null) {
+  recordDecision(symbol, context, decision, profit = null, features = null) {
     if (!this.isEnabled()) return;
     const record = {
       id: crypto.randomUUID(),
       symbol,
       timestamp: Date.now(),
-      context: this.extractFeatures(context),
+      context: this.recordFeatures(context, features),
       decision: {
         allowTrading: decision.allowTrading,
         allowBuy: decision.allowBuy,
@@ -620,6 +620,17 @@ class LearningMemory {
       this.records = this.records.slice(-LEARNING_MEMORY_MAX_RECORDS);
     }
     this.save();
+  }
+
+  recordFeatures(context, features = null) {
+    const extracted = this.extractFeatures(context);
+    if (!isPlainObject(features)) return extracted;
+    for (const key of Object.keys(extracted)) {
+      if (Number.isFinite(Number(features[key]))) {
+        extracted[key] = Number(features[key]);
+      }
+    }
+    return extracted;
   }
 
   extractFeatures(context) {
@@ -1087,7 +1098,7 @@ Be conservative. Protect capital first.
             `-> confidence ${oldConfidence.toFixed(1)} -> ${decision.confidence.toFixed(1)} (factor=${factor.toFixed(2)})`
           );
         }
-        this.learningMemory.recordDecision(symbol, context, decision, profit);
+        this.learningMemory.recordDecision(symbol, context, decision, profit, features);
         this.setCached(cacheKey, decision);
         this.rememberDecision(symbol, decision);
       }
@@ -1290,6 +1301,27 @@ class SpotGridEngine {
     symState.lastBuyByLevel = shiftedBuys;
   }
 
+  mergeBuyRecords(existing, incoming) {
+    if (!existing) return { ...incoming };
+    const existingAmount = Number(existing.amount) || 0;
+    const incomingAmount = Number(incoming.amount) || 0;
+    const amount = existingAmount + incomingAmount;
+    const sellableAmount = numberOrZero(existing.sellableAmount ?? existing.amount) +
+      numberOrZero(incoming.sellableAmount ?? incoming.amount);
+    const totalCostQuote = (Number(existing.totalCostQuote) || 0) + (Number(incoming.totalCostQuote) || 0);
+    const totalFeeQuote = (Number(existing.totalFeeQuote) || 0) + (Number(incoming.totalFeeQuote) || 0);
+    return {
+      ...existing,
+      ...incoming,
+      price: amount > 0 && totalCostQuote > 0 ? totalCostQuote / amount : Number(incoming.price ?? existing.price) || 0,
+      amount,
+      sellableAmount,
+      totalCostQuote,
+      totalFeeQuote,
+      at: Date.parse(incoming.at || 0) > Date.parse(existing.at || 0) ? incoming.at : existing.at,
+    };
+  }
+
   async applyTrailingRangeShift(symbol, lower, upper, shift, direction) {
     // 1. Cancel existing grid orders first (so we don't leave stale orders if something fails)
     const cancelResult = await this.cancelGridOrders(symbol, `trailing-${direction}`);
@@ -1312,8 +1344,21 @@ class SpotGridEngine {
     const cleanedBuys = {};
     for (const [idx, buy] of Object.entries(symState.lastBuyByLevel)) {
       const newIdx = Number(idx);
-      if (newIdx >= 0 && newIdx <= GRID_COUNT) cleanedBuys[newIdx] = buy;
-      else console.warn(`[TRAILING] Dropping buy at level ${idx} (out of new range after ${direction} shift)`);
+      const exitIdx = newIdx < 0
+        ? -1
+        : newIdx >= GRID_COUNT
+          ? GRID_COUNT - 1
+          : newIdx;
+      if (exitIdx >= -1 && exitIdx < GRID_COUNT) {
+        cleanedBuys[exitIdx] = this.mergeBuyRecords(cleanedBuys[exitIdx], buy);
+        if (exitIdx !== newIdx) {
+          console.warn(
+            `[TRAILING] Keeping buy at shifted level ${newIdx} as exit level ${exitIdx} after ${direction} shift`
+          );
+        }
+      } else {
+        console.warn(`[TRAILING] Dropping buy at level ${idx} (out of new range after ${direction} shift)`);
+      }
     }
     symState.lastBuyByLevel = cleanedBuys;
     trailingState.shifts += shift.steps;

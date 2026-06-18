@@ -77,6 +77,37 @@ test('trailing-up follows a large move by shifting multiple grids', async () => 
   assert.equal(symbolState.trailingUp.shifts, 3);
 });
 
+test('trailing-up keeps below-range buy lots on exit level', async () => {
+  const symbolState = {
+    config: { lower: 90, upper: 110 },
+    orders: {},
+    lastBuyByLevel: {
+      0: {
+        price: 90,
+        amount: 1,
+        sellableAmount: 0.99,
+        totalCostQuote: 90,
+        totalFeeQuote: 0.1,
+        at: '2026-01-01T00:00:00.000Z',
+      },
+    },
+    trailingUp: { shifts: 0, lastShiftAt: null },
+  };
+  const engine = Object.create(SpotGridEngine.prototype);
+  engine.state = {
+    getSymbol: () => symbolState,
+    save: () => {},
+  };
+  engine.cancelGridOrders = async () => ({ cancelled: [], failed: [] });
+  engine.sendAlert = async () => {};
+
+  await engine.applyTrailingRangeShift('BTC/USDT', 90, 110, { lower: 92, upper: 112, steps: 1 }, 'up');
+
+  assert.deepEqual(Object.keys(symbolState.lastBuyByLevel), ['-1']);
+  assert.equal(symbolState.lastBuyByLevel[-1].sellableAmount, 0.99);
+  assert.equal(engine.amountForTrackedSell('BTC/USDT', 0), 0.99);
+});
+
 test('trailing-up aborts state shift when order cancellation fails', async () => {
   const symbolState = {
     config: { lower: 90, upper: 110 },

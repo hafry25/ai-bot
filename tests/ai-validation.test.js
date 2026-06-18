@@ -180,6 +180,37 @@ test('LearningMemory weighting favors recent outcomes', () => {
   assert.equal(typeof result.closestDistance, 'number');
 });
 
+test('LearningMemory stores enriched candle features for recorded decisions', () => {
+  const memory = Object.create(LearningMemory.prototype);
+  memory.enabled = true;
+  memory.records = [];
+  memory.save = () => {};
+
+  const context = {
+    currentPrice: 100,
+    lower: 90,
+    upper: 110,
+    trailingUpJustShifted: true,
+  };
+  const features = memory.enrichContext(context, {
+    changePct: 3.25,
+    volumeRatio: 1.75,
+  });
+
+  memory.recordDecision(
+    'BTC/USDT',
+    context,
+    { allowTrading: true, allowBuy: true, allowSell: true, confidence: 88, reason: 'ok' },
+    12,
+    features
+  );
+
+  assert.equal(memory.records.length, 1);
+  assert.equal(memory.records[0].context.changePct, 3.25);
+  assert.equal(memory.records[0].context.volumeRatio, 1.75);
+  assert.equal(memory.records[0].context.trailingUp, 1);
+});
+
 test('AI validation cache evicts least recently used non-expired entry', () => {
   AIGridValidator.cache.clear();
   AIGridValidator.MAX_CACHE_SIZE = 2;
