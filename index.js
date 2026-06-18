@@ -1597,6 +1597,7 @@ class SpotGridEngine {
     }
     
     this.state.data.totals.filledBuys++;
+    this.state.save();
     this.forgetOrderIfClosed(symState, trade, openOrderIds);
     this.state.markProcessedTrade(symbol, this.getTradeId(trade));
     await this.sendAlert(`[GRID BUY] ${symbol} amount=${amount} @ ${price} | sellable=${sellableAmount} | fee=${feeQuote.toFixed(4)} ${quote}`);
@@ -1652,6 +1653,7 @@ class SpotGridEngine {
       delete symState.lastBuyByLevel[buyLevelIndex];
     }
     
+    this.state.save();
     this.state.markProcessedTrade(symbol, this.getTradeId(trade));
     await this.sendAlert(`[GRID SELL] ${symbol} amount=${amount} @ ${price} | profit=${profit.toFixed(4)} ${quote} | fee=${feeQuote.toFixed(4)} ${quote}`);
     
