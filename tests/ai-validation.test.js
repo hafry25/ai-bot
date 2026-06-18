@@ -6,7 +6,7 @@ process.env.AI_VALIDATION_MIN_INTERVAL_MS = '60000';
 process.env.AI_VALIDATION_CACHE_TTL_MS = '60000';
 process.env.GEMINI_API_KEY = 'test-key';
 
-const { AIGridValidator } = require('../index');
+const { AIGridValidator, LearningMemory } = require('../index');
 
 test('AI validation reuses the last decision during the minimum interval', async () => {
   AIGridValidator.lastDecisionBySymbol.clear();
@@ -59,4 +59,64 @@ test('AI validation reuses the last decision during the minimum interval', async
   assert.equal(second, first);
   assert.equal(ohlcvCalls, 1);
   assert.equal(modelCalls, 1);
+});
+
+test('LearningMemory weighting favors recent outcomes', () => {
+  const memory = Object.create(LearningMemory.prototype);
+  memory.enabled = true;
+  memory.records = [];
+
+  const now = Date.now();
+  const features = {
+    symbol: 'BTC/USDT',
+    currentPrice: 100,
+    rangePct: 5,
+    distLower: 2,
+    distUpper: 3,
+    positionPct: 40,
+    trailingUp: 0,
+    trailingDown: 0,
+    changePct: 1,
+    volumeRatio: 1,
+  };
+
+  memory.records.push(
+    {
+      symbol: 'BTC/USDT',
+      timestamp: now - 48 * 60 * 60 * 1000,
+      context: { ...features },
+      outcome: 'success',
+    },
+    {
+      symbol: 'BTC/USDT',
+      timestamp: now - 5 * 60 * 60 * 1000,
+      context: { ...features },
+      outcome: 'failure',
+    },
+    {
+      symbol: 'BTC/USDT',
+      timestamp: now - 5 * 60 * 60 * 1000,
+      context: { ...features },
+      outcome: 'failure',
+    },
+    {
+      symbol: 'BTC/USDT',
+      timestamp: now - 5 * 60 * 60 * 1000,
+      context: { ...features },
+      outcome: 'failure',
+    },
+    {
+      symbol: 'BTC/USDT',
+      timestamp: now - 5 * 60 * 60 * 1000,
+      context: { ...features },
+      outcome: 'failure',
+    }
+  );
+
+  const result = memory.querySimilarWithFeatures(features);
+
+  assert.ok(result);
+  assert.equal(result.samples, 5);
+  assert.ok(result.ratio > result.weightedRatio);
+  assert.equal(typeof result.closestDistance, 'number');
 });

@@ -117,6 +117,11 @@ const LEARNING_MEMORY_PATH = path.resolve(process.cwd(), LEARNING_MEMORY_FILE);
 const LEARNING_MEMORY_LOOKBACK = Config.number('LEARNING_MEMORY_LOOKBACK', 20);
 const LEARNING_MEMORY_MIN_SAMPLES = Config.number('LEARNING_MEMORY_MIN_SAMPLES', 5);
 const LEARNING_MEMORY_OUTCOME_DELAY_MS = Config.number('LEARNING_MEMORY_OUTCOME_DELAY_MS', 10 * MINUTE_MS);
+const LEARNING_MEMORY_RECENCY_HALF_LIFE_MS = Math.max(
+  Config.number('LEARNING_MEMORY_RECENCY_HALF_LIFE_HOURS', 24),
+  1
+) * 60 * 60 * 1000;
+const LEARNING_MEMORY_MAX_RECORDS = Config.number('LEARNING_MEMORY_MAX_RECORDS', 2000);
 // ---------------------------------------
 
 const MAX_PROCESSED_TRADE_IDS = 2000;
@@ -495,16 +500,24 @@ class LearningMemory {
   constructor() {
     this.records = [];
     this.filePath = LEARNING_MEMORY_PATH;
+    this.enabled = LEARNING_MEMORY_ENABLED;
     if (LEARNING_MEMORY_ENABLED) {
       this.load();
     }
+  }
+
+  isEnabled() {
+    return this.enabled !== false;
   }
 
   load() {
     try {
       if (fs.existsSync(this.filePath)) {
         const raw = fs.readFileSync(this.filePath, 'utf8');
-        this.records = JSON.parse(raw);
+        const parsed = JSON.parse(raw);
+        this.records = Array.isArray(parsed)
+          ? parsed.map(record => this.normalizeRecord(record)).filter(Boolean)
+          : [];
         console.log(`[MEMORY] Loaded ${this.records.length} decision records.`);
       }
     } catch (err) {
@@ -514,15 +527,47 @@ class LearningMemory {
   }
 
   save() {
-    if (!LEARNING_MEMORY_ENABLED) return;
+    if (!this.isEnabled()) return;
     const temp = `${this.filePath}.tmp`;
-    fs.writeFileSync(temp, JSON.stringify(this.records, null, 2));
+    fs.writeFileSync(temp, `${JSON.stringify(this.records, null, 2)}\n`);
     fs.renameSync(temp, this.filePath);
   }
 
+  normalizeRecord(record) {
+    if (!isPlainObject(record)) return null;
+    const context = isPlainObject(record.context) ? this.extractFeatures(record.context) : null;
+    if (!context) return null;
+    return {
+      id: typeof record.id === 'string' ? record.id : crypto.randomUUID(),
+      symbol: typeof record.symbol === 'string' ? record.symbol : 'unknown',
+      timestamp: Number(record.timestamp) || Date.now(),
+      context,
+      decision: isPlainObject(record.decision)
+        ? {
+            allowTrading: record.decision.allowTrading === true,
+            allowBuy: record.decision.allowBuy === true,
+            allowSell: record.decision.allowSell === true,
+            confidence: Number(record.decision.confidence) || 0,
+            reason: String(record.decision.reason || ''),
+          }
+        : {
+            allowTrading: false,
+            allowBuy: false,
+            allowSell: false,
+            confidence: 0,
+            reason: '',
+          },
+      profitAtDecision: Number.isFinite(Number(record.profitAtDecision)) ? Number(record.profitAtDecision) : null,
+      outcome: record.outcome === 'success' || record.outcome === 'failure' ? record.outcome : null,
+      outcomeAt: Number(record.outcomeAt) || null,
+      outcomeDelta: Number.isFinite(Number(record.outcomeDelta)) ? Number(record.outcomeDelta) : null,
+    };
+  }
+
   recordDecision(symbol, context, decision, profit = null) {
-    if (!LEARNING_MEMORY_ENABLED) return;
+    if (!this.isEnabled()) return;
     const record = {
+      id: crypto.randomUUID(),
       symbol,
       timestamp: Date.now(),
       context: this.extractFeatures(context),
@@ -537,26 +582,32 @@ class LearningMemory {
       outcome: null,
     };
     this.records.push(record);
-    if (this.records.length > 2000) {
-      this.records = this.records.slice(-2000);
+    if (this.records.length > LEARNING_MEMORY_MAX_RECORDS) {
+      this.records = this.records.slice(-LEARNING_MEMORY_MAX_RECORDS);
     }
     this.save();
   }
 
   extractFeatures(context) {
     const {
-      currentPrice, lower, upper, levels,
+      currentPrice, lower, upper,
       trailingUpJustShifted, trailingDownJustShifted
     } = context;
-    const mid = (lower + upper) / 2;
-    const rangePct = ((upper - lower) / mid) * 100;
-    const distLower = ((currentPrice - lower) / currentPrice) * 100;
-    const distUpper = ((upper - currentPrice) / currentPrice) * 100;
+    const price = Number(currentPrice) || 0;
+    const lowerPrice = Number(lower) || 0;
+    const upperPrice = Number(upper) || 0;
+    const span = Math.max(upperPrice - lowerPrice, 0);
+    const mid = (lowerPrice + upperPrice) / 2;
+    const rangePct = mid > 0 ? (span / mid) * 100 : 0;
+    const distLower = price > 0 ? ((price - lowerPrice) / price) * 100 : 0;
+    const distUpper = price > 0 ? ((upperPrice - price) / price) * 100 : 0;
+    const positionPct = span > 0 ? ((price - lowerPrice) / span) * 100 : 50;
     return {
-      currentPrice,
+      currentPrice: price,
       rangePct: rangePct || 0,
       distLower: distLower || 0,
       distUpper: distUpper || 0,
+      positionPct: positionPct || 0,
       trailingUp: trailingUpJustShifted ? 1 : 0,
       trailingDown: trailingDownJustShifted ? 1 : 0,
       changePct: 0,
@@ -571,11 +622,11 @@ class LearningMemory {
   }
 
   similarity(f1, f2) {
-    const norm = (val, min, max) => (val - min) / (max - min);
     const features = [
       { a: f1.rangePct, b: f2.rangePct, min: 0, max: 20 },
       { a: f1.distLower, b: f2.distLower, min: -20, max: 20 },
       { a: f1.distUpper, b: f2.distUpper, min: -20, max: 20 },
+      { a: f1.positionPct, b: f2.positionPct, min: 0, max: 100 },
       { a: f1.changePct, b: f2.changePct, min: -20, max: 20 },
       { a: f1.volumeRatio, b: f2.volumeRatio, min: 0, max: 10 },
       { a: f1.trailingUp, b: f2.trailingUp, min: 0, max: 1 },
@@ -590,8 +641,17 @@ class LearningMemory {
     return Math.sqrt(sumSq / features.length);
   }
 
+  similarityWeight(distance) {
+    return 1 / (1 + Math.max(distance, 0));
+  }
+
+  recencyWeight(timestamp) {
+    const ageMs = Math.max(Date.now() - Number(timestamp || 0), 0);
+    return Math.pow(0.5, ageMs / LEARNING_MEMORY_RECENCY_HALF_LIFE_MS);
+  }
+
   querySimilarWithFeatures(features) {
-    if (!LEARNING_MEMORY_ENABLED) return null;
+    if (!this.isEnabled()) return null;
     const now = Date.now();
     const candidates = this.records.filter(r =>
       r.symbol === features.symbol &&
@@ -600,19 +660,42 @@ class LearningMemory {
     );
     if (candidates.length < LEARNING_MEMORY_MIN_SAMPLES) return null;
 
-    const scored = candidates.map(r => ({
-      ...r,
-      dist: this.similarity(features, r.context),
-    }));
+    const scored = candidates.map(r => {
+      const dist = this.similarity(features, r.context);
+      const similarityWeight = this.similarityWeight(dist);
+      const recencyWeight = this.recencyWeight(r.timestamp);
+      return {
+        ...r,
+        dist,
+        similarityWeight,
+        recencyWeight,
+        weight: similarityWeight * recencyWeight,
+      };
+    });
     scored.sort((a, b) => a.dist - b.dist);
     const top = scored.slice(0, LEARNING_MEMORY_LOOKBACK);
+    const weighted = top.reduce((acc, record) => {
+      if (record.outcome === 'success') acc.success += record.weight;
+      if (record.outcome !== null) acc.total += record.weight;
+      return acc;
+    }, { success: 0, total: 0 });
+    if (weighted.total <= 0) return null;
+
     const successes = top.filter(r => r.outcome === 'success').length;
     const ratio = successes / top.length;
-    return { ratio, samples: top.length };
+    const weightedRatio = weighted.success / weighted.total;
+    const nearest = top[0];
+    return {
+      ratio,
+      weightedRatio,
+      samples: top.length,
+      weightedSamples: roundNumber(weighted.total, 4),
+      closestDistance: roundNumber(nearest?.dist, 4),
+    };
   }
 
   updateOutcomes(symbol, currentProfit, profitThreshold) {
-    if (!LEARNING_MEMORY_ENABLED) return;
+    if (!this.isEnabled()) return;
     const now = Date.now();
     let updated = false;
     const threshold = Number.isFinite(profitThreshold) ? profitThreshold : 0;
@@ -623,6 +706,8 @@ class LearningMemory {
       if (record.profitAtDecision === null) continue;
       const profitChange = currentProfit - record.profitAtDecision;
       record.outcome = profitChange > threshold ? 'success' : 'failure';
+      record.outcomeAt = now;
+      record.outcomeDelta = profitChange;
       updated = true;
     }
     if (updated) this.save();
@@ -916,16 +1001,15 @@ Be conservative. Protect capital first.
         features.symbol = symbol;
         const queryResult = this.learningMemory.querySimilarWithFeatures(features);
         if (queryResult && queryResult.samples >= LEARNING_MEMORY_MIN_SAMPLES) {
-          const successRatio = queryResult.ratio;
-          // factor = 0.5 + successRatio -> 1.0 at 50% success (neutral)
-          const factor = 0.5 + successRatio;
+          const successRatio = Number.isFinite(queryResult.weightedRatio) ? queryResult.weightedRatio : queryResult.ratio;
+          const factor = 0.85 + (successRatio * 0.3);
           const oldConfidence = decision.confidence;
           decision.confidence = Math.min(100, Math.max(0, decision.confidence * factor));
           const direction = factor > 1 ? 'boosted' : (factor < 1 ? 'reduced' : 'unchanged');
           const pctSuccess = (successRatio * 100).toFixed(0);
-          decision.reason += ` | Memory: ${pctSuccess}% similar success (${queryResult.samples} samples) -> confidence ${oldConfidence.toFixed(1)} -> ${decision.confidence.toFixed(1)} (${direction}, x${factor.toFixed(2)})`;
+          decision.reason += ` | Memory: ${pctSuccess}% weighted success (${queryResult.samples} samples, closest=${queryResult.closestDistance}) -> confidence ${oldConfidence.toFixed(1)} -> ${decision.confidence.toFixed(1)} (${direction}, x${factor.toFixed(2)})`;
           console.log(
-            `[MEMORY] ${symbol} success ratio ${pctSuccess}% (${queryResult.samples} samples) ` +
+            `[MEMORY] ${symbol} weighted success ${pctSuccess}% (${queryResult.samples} samples, weighted=${queryResult.weightedSamples}) ` +
             `-> confidence ${oldConfidence.toFixed(1)} -> ${decision.confidence.toFixed(1)} (factor=${factor.toFixed(2)})`
           );
         }
@@ -1937,6 +2021,7 @@ module.exports = {
   AIGridValidator,
   Config,
   GridState,
+  LearningMemory,
   ProcessLock,
   SpotGridEngine,
   bootstrap,
