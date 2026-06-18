@@ -1686,6 +1686,8 @@ class SpotGridEngine {
       );
     }
 
+    // Re-read balances after any refill orders so placement loops use fresh funds.
+    balance = await retry(() => this.exchange.fetchBalance());
     let freshOpenOrders = await retry(() => this.exchange.fetchOpenOrders(symbol));
     let managedOrders = this.getManagedOpenOrders(symbol, freshOpenOrders);
 
