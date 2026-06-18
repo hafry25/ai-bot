@@ -78,12 +78,17 @@ const GRID_MAX_ACTIVE_BUY_ORDERS = Config.number('GRID_MAX_ACTIVE_BUY_ORDERS', 5
 const GRID_MAX_ACTIVE_SELL_ORDERS = Config.number('GRID_MAX_ACTIVE_SELL_ORDERS', 5);
 const GRID_RECREATE_ON_START = Config.boolean('GRID_RECREATE_ON_START', false);
 const GRID_CANCEL_OUT_OF_RANGE = Config.boolean('GRID_CANCEL_OUT_OF_RANGE', true);
+const GRID_CANCEL_OUT_OF_RANGE_THRESHOLD_MS = Math.max(
+  Config.number('GRID_CANCEL_OUT_OF_RANGE_THRESHOLD_MINUTES', Math.max(INTERVAL_MINUTES * 3, 2)),
+  0
+) * MINUTE_MS;
 const GRID_REFILL_ON_FILLED = Config.boolean('GRID_REFILL_ON_FILLED', true);
 const GRID_STATE_FILE = Config.get('GRID_STATE_FILE', 'grid-state-spot.json');
 const GRID_STATE_PATH = path.resolve(process.cwd(), GRID_STATE_FILE);
 const BOT_LOCK_FILE = Config.get('BOT_LOCK_FILE', `${GRID_STATE_FILE}.lock`);
 const BOT_LOCK_PATH = path.resolve(process.cwd(), BOT_LOCK_FILE);
 const GRID_POST_ONLY = Config.boolean('GRID_POST_ONLY', true);
+const GRID_PRICE_PRECISION_MAX_DEVIATION_PCT = Config.number('GRID_PRICE_PRECISION_MAX_DEVIATION_PCT', 0.05);
 
 const AI_VALIDATION_ENABLED = Config.boolean('AI_VALIDATION_ENABLED', false);
 const AI_VALIDATION_TIMEFRAME = Config.get('AI_VALIDATION_TIMEFRAME', '15m');
@@ -122,6 +127,7 @@ const LEARNING_MEMORY_RECENCY_HALF_LIFE_MS = Math.max(
   1
 ) * 60 * 60 * 1000;
 const LEARNING_MEMORY_MAX_RECORDS = Config.number('LEARNING_MEMORY_MAX_RECORDS', 2000);
+const LEARNING_MEMORY_PROFIT_THRESHOLD_PCT = Config.number('LEARNING_MEMORY_PROFIT_THRESHOLD_PCT', 0.5);
 // ---------------------------------------
 
 const MAX_PROCESSED_TRADE_IDS = 2000;
@@ -256,14 +262,37 @@ class ProcessLock {
 
   readOwner() {
     const raw = fs.readFileSync(this.lockPath, 'utf8').trim();
+    if (!raw) {
+      return { pid: null, token: null, malformed: true };
+    }
     try {
       const parsed = JSON.parse(raw);
+      const pid = Number(parsed.pid);
+      if (!Number.isInteger(pid) || pid <= 0) {
+        return { pid: null, token: null, malformed: true };
+      }
       return {
-        pid: Number(parsed.pid),
+        pid,
         token: typeof parsed.token === 'string' ? parsed.token : null,
       };
     } catch {
-      return { pid: Number(raw), token: null };
+      const pid = Number(raw);
+      if (Number.isInteger(pid) && pid > 0) {
+        return { pid, token: null };
+      }
+      return { pid: null, token: null, malformed: true };
+    }
+  }
+
+  removeMalformedLock(owner) {
+    if (!owner?.malformed || this.processIsAlive(owner.pid)) return false;
+    try {
+      fs.unlinkSync(this.lockPath);
+      console.warn(`[LOCK] Removed malformed stale lock ${this.lockPath}`);
+      return true;
+    } catch (err) {
+      if (err.code !== 'ENOENT') throw err;
+      return true;
     }
   }
 
@@ -281,6 +310,7 @@ class ProcessLock {
   assertLockCanBeAcquired() {
     try {
       const owner = this.readOwner();
+      if (this.removeMalformedLock(owner)) return true;
       if (!this.processIsAlive(owner.pid)) {
         throw new Error(
           `Stale bot lock found for PID ${owner.pid}. ` +
@@ -322,6 +352,7 @@ class ProcessLock {
     } catch (err) {
       if (err.code !== 'EEXIST') throw err;
       const owner = this.readOwner();
+      if (this.removeMalformedLock(owner)) return this.acquire();
       if (this.processIsAlive(owner.pid)) {
         throw new Error(`Bot already running with PID ${owner.pid}. Lock: ${this.lockPath}`);
       }
@@ -940,7 +971,14 @@ Be conservative. Protect capital first.
   }
 
   async validate(symbol, context, options = {}, profit = null) {
-    if (!AI_VALIDATION_ENABLED) return AIGridValidator.allow();
+    if (!AI_VALIDATION_ENABLED) {
+      const decision = AIGridValidator.allow();
+      this.rememberDecision(symbol, decision);
+      if (this.learningMemory) {
+        this.learningMemory.recordDecision(symbol, context, decision, profit);
+      }
+      return decision;
+    }
 
     const { ignoreMinInterval = false } = options;
     const cacheKey = this.cacheKey(symbol, context.currentPrice, context.levels);
@@ -1090,8 +1128,8 @@ class SpotGridEngine {
 
   getLearningMemoryProfitThreshold() {
     // Auto-scale with the grid size so smaller bots do not need a manual env tweak.
-    // Roughly 0.5% of per-grid notional, with a small floor to avoid noise.
-    return Math.max(0.1, this.getOrderSizeUsdt() * 0.005);
+    // Defaults to 0.5% of per-grid notional, with a small floor to avoid noise.
+    return Math.max(0.1, this.getOrderSizeUsdt() * (LEARNING_MEMORY_PROFIT_THRESHOLD_PCT / 100));
   }
 
   buildRange(symbol, currentPrice) {
@@ -1417,7 +1455,7 @@ class SpotGridEngine {
       const priceNum = Number(price);
       const preciseNum = Number(precisePrice);
       const priceDiffPct = Math.abs(preciseNum - priceNum) / priceNum * 100;
-      if (priceDiffPct > 0.5) {
+      if (priceDiffPct > GRID_PRICE_PRECISION_MAX_DEVIATION_PCT) {
         console.warn(
           `[SKIP] ${symbol} ${side.toUpperCase()} level=${levelIndex} price=${price} -> ${precisePrice} | precision adjustment too large (${priceDiffPct.toFixed(4)}%)`
         );
@@ -1776,7 +1814,7 @@ class SpotGridEngine {
     let managedOrders = this.getManagedOpenOrders(symbol, freshOpenOrders);
 
     if (GRID_CANCEL_OUT_OF_RANGE) {
-      const recentThresholdMs = Math.max(INTERVAL_MS * 3, MINUTE_MS * 2);
+      const recentThresholdMs = GRID_CANCEL_OUT_OF_RANGE_THRESHOLD_MS;
       for (const order of managedOrders) {
         const orderTimestamp = Date.parse(order.timestamp || order.datetime || 0);
         const orderAgeMs = Date.now() - orderTimestamp;

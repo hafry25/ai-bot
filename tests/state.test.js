@@ -131,3 +131,21 @@ test('ProcessLock fails closed instead of deleting a stale lock', () => {
     fs.rmSync(directory, { recursive: true, force: true });
   }
 });
+
+test('ProcessLock removes malformed crash artifact before acquiring', () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'grid-lock-'));
+  const lockPath = path.join(directory, 'bot.lock');
+  fs.writeFileSync(lockPath, '');
+  const lock = new ProcessLock(lockPath);
+
+  try {
+    lock.acquire();
+
+    const owner = JSON.parse(fs.readFileSync(lockPath, 'utf8'));
+    assert.equal(owner.pid, process.pid);
+    assert.equal(typeof owner.token, 'string');
+  } finally {
+    lock.release();
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
