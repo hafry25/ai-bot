@@ -117,7 +117,6 @@ const LEARNING_MEMORY_PATH = path.resolve(process.cwd(), LEARNING_MEMORY_FILE);
 const LEARNING_MEMORY_LOOKBACK = Config.number('LEARNING_MEMORY_LOOKBACK', 20);
 const LEARNING_MEMORY_MIN_SAMPLES = Config.number('LEARNING_MEMORY_MIN_SAMPLES', 5);
 const LEARNING_MEMORY_OUTCOME_DELAY_MS = Config.number('LEARNING_MEMORY_OUTCOME_DELAY_MS', 10 * MINUTE_MS);
-const LEARNING_MEMORY_PROFIT_THRESHOLD = Config.number('LEARNING_MEMORY_PROFIT_THRESHOLD', 0.5);
 // ---------------------------------------
 
 const MAX_PROCESSED_TRADE_IDS = 2000;
@@ -612,17 +611,18 @@ class LearningMemory {
     return { ratio, samples: top.length };
   }
 
-  updateOutcomes(symbol, currentProfit) {
+  updateOutcomes(symbol, currentProfit, profitThreshold) {
     if (!LEARNING_MEMORY_ENABLED) return;
     const now = Date.now();
     let updated = false;
+    const threshold = Number.isFinite(profitThreshold) ? profitThreshold : 0;
     for (const record of this.records) {
       if (record.symbol !== symbol) continue;
       if (record.outcome !== null) continue;
       if (now - record.timestamp < LEARNING_MEMORY_OUTCOME_DELAY_MS) continue;
       if (record.profitAtDecision === null) continue;
       const profitChange = currentProfit - record.profitAtDecision;
-      record.outcome = profitChange > LEARNING_MEMORY_PROFIT_THRESHOLD ? 'success' : 'failure';
+      record.outcome = profitChange > threshold ? 'success' : 'failure';
       updated = true;
     }
     if (updated) this.save();
@@ -1002,6 +1002,12 @@ class SpotGridEngine {
       return GRID_TOTAL_INVESTMENT_USDT / Math.max(GRID_COUNT, 1);
     }
     return GRID_ORDER_SIZE_USDT;
+  }
+
+  getLearningMemoryProfitThreshold() {
+    // Auto-scale with the grid size so smaller bots do not need a manual env tweak.
+    // Roughly 0.5% of per-grid notional, with a small floor to avoid noise.
+    return Math.max(0.1, this.getOrderSizeUsdt() * 0.005);
   }
 
   buildRange(symbol, currentPrice) {
@@ -1673,7 +1679,11 @@ class SpotGridEngine {
     await this.handleFilledTrades(symbol, levels, aiDecision);
 
     if (this.aiValidator.learningMemory) {
-      this.aiValidator.learningMemory.updateOutcomes(symbol, symState.realizedGridProfit);
+      this.aiValidator.learningMemory.updateOutcomes(
+        symbol,
+        symState.realizedGridProfit,
+        this.getLearningMemoryProfitThreshold()
+      );
     }
 
     let freshOpenOrders = await retry(() => this.exchange.fetchOpenOrders(symbol));

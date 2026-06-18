@@ -59,7 +59,10 @@ node index.js
 - `GRID_RANGE_PCT`: dipakai kalau range manual tidak diisi
 - `GRID_ORDER_SIZE_USDT` atau `GRID_TOTAL_INVESTMENT_USDT`: pilih salah satu untuk ukuran modal
 - `AI_VALIDATION_ENABLED`: aktifkan jika ingin bot meminta validasi Gemini
+- `LEARNING_MEMORY_ENABLED`: aktifkan jika ingin bot menyimpan dan memakai histori keputusan
 - `FONNTE_ENABLED`: aktifkan jika ingin notifikasi WhatsApp via Fonnte
+
+Learning memory memakai batas profit minimal otomatis dari ukuran order grid, jadi tidak ada env khusus untuk threshold profit.
 
 ## File State
 
