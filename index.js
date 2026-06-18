@@ -88,6 +88,7 @@ const GRID_STATE_FILE = Config.get('GRID_STATE_FILE', 'grid-state-spot.json');
 const GRID_STATE_PATH = path.resolve(process.cwd(), GRID_STATE_FILE);
 const BOT_LOCK_FILE = Config.get('BOT_LOCK_FILE', `${GRID_STATE_FILE}.lock`);
 const BOT_LOCK_PATH = path.resolve(process.cwd(), BOT_LOCK_FILE);
+const BOT_LOCK_STALE_GRACE_MS = Math.max(Config.number('BOT_LOCK_STALE_GRACE_MS', 2000), 0);
 const GRID_POST_ONLY = Config.boolean('GRID_POST_ONLY', true);
 const GRID_PRICE_PRECISION_MAX_DEVIATION_PCT = Config.number('GRID_PRICE_PRECISION_MAX_DEVIATION_PCT', 0.05);
 
@@ -99,6 +100,7 @@ const AI_VALIDATION_MIN_INTERVAL_MS = Config.number('AI_VALIDATION_MIN_INTERVAL_
 const AI_VALIDATION_BACKOFF_MS = Config.number('AI_VALIDATION_BACKOFF_MS', 10 * MINUTE_MS);
 const AI_VALIDATION_PRICE_BUCKET_PCT = Config.number('AI_VALIDATION_PRICE_BUCKET_PCT', 0.25);
 const AI_VALIDATION_RETRIES = Config.number('AI_VALIDATION_RETRIES', 2);
+const AI_VALIDATION_TIMEOUT_MS = Math.max(Config.number('AI_VALIDATION_TIMEOUT_MS', 30_000), 1000);
 const AI_MIN_CONFIDENCE = Config.number('AI_MIN_CONFIDENCE', 70);
 const GEMINI_MODEL = Config.get('GEMINI_MODEL', 'gemini-2.0-flash-lite');
 
@@ -140,6 +142,25 @@ const CIRCUIT_BREAKER_PAUSE_MS = 15 * MINUTE_MS;
 //  Utility Functions
 // ------------------------------
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+
+function sleepSync(ms) {
+  if (!(ms > 0)) return;
+  const buffer = new SharedArrayBuffer(4);
+  Atomics.wait(new Int32Array(buffer), 0, 0, ms);
+}
+
+async function withTimeout(promise, timeoutMs, message) {
+  let timeoutId;
+  const timeout = new Promise((_, reject) => {
+    timeoutId = setTimeout(() => reject(new Error(message)), timeoutMs);
+    if (timeoutId.unref) timeoutId.unref();
+  });
+  try {
+    return await Promise.race([promise, timeout]);
+  } finally {
+    clearTimeout(timeoutId);
+  }
+}
 
 async function retry(fn, retries = 3, delay = 1500) {
   for (let attempt = 1; attempt <= retries; attempt++) {
@@ -215,6 +236,8 @@ function validateRuntimeConfiguration() {
   requireInteger('GRID_MAX_ACTIVE_BUY_ORDERS', GRID_MAX_ACTIVE_BUY_ORDERS);
   requireInteger('GRID_MAX_ACTIVE_SELL_ORDERS', GRID_MAX_ACTIVE_SELL_ORDERS);
   requireInteger('AI_VALIDATION_RETRIES', AI_VALIDATION_RETRIES);
+  requireNonNegative('BOT_LOCK_STALE_GRACE_MS', BOT_LOCK_STALE_GRACE_MS);
+  requirePositive('AI_VALIDATION_TIMEOUT_MS', AI_VALIDATION_TIMEOUT_MS);
   requirePositive('FONNTE_TIMEOUT_MS', FONNTE_TIMEOUT_MS);
 
   const hasLower = GRID_LOWER_PRICE > 0;
@@ -297,6 +320,34 @@ class ProcessLock {
     }
   }
 
+  removeStaleLock(owner) {
+    if (!owner || owner.malformed || this.processIsAlive(owner.pid)) return false;
+    console.warn(
+      `[LOCK] Found stale lock for PID ${owner.pid}; waiting ${BOT_LOCK_STALE_GRACE_MS}ms before cleanup`
+    );
+    sleepSync(BOT_LOCK_STALE_GRACE_MS);
+
+    let latest;
+    try {
+      latest = this.readOwner();
+    } catch (err) {
+      if (err.code === 'ENOENT') return true;
+      throw err;
+    }
+
+    const sameOwner = latest.pid === owner.pid && latest.token === owner.token;
+    if (!sameOwner || this.processIsAlive(latest.pid)) return false;
+
+    try {
+      fs.unlinkSync(this.lockPath);
+      console.warn(`[LOCK] Removed stale lock ${this.lockPath} for dead PID ${owner.pid}`);
+      return true;
+    } catch (err) {
+      if (err.code !== 'ENOENT') throw err;
+      return true;
+    }
+  }
+
   ownsLock() {
     if (!this.ownerToken) return false;
     try {
@@ -312,12 +363,8 @@ class ProcessLock {
     try {
       const owner = this.readOwner();
       if (this.removeMalformedLock(owner)) return true;
-      if (!this.processIsAlive(owner.pid)) {
-        throw new Error(
-          `Stale bot lock found for PID ${owner.pid}. ` +
-          `Inspect ${this.lockPath} and remove it manually if no bot is running.`
-        );
-      }
+      if (this.removeStaleLock(owner)) return true;
+      if (!this.processIsAlive(owner.pid)) return false;
       return false;
     } catch (err) {
       if (err.code === 'ENOENT') return true;
@@ -326,13 +373,7 @@ class ProcessLock {
   }
 
   acquire() {
-    for (let attempt = 0; attempt < 3; attempt++) {
-      const lockMissing = this.assertLockCanBeAcquired();
-      if (!lockMissing) {
-        const owner = this.readOwner();
-        throw new Error(`Bot already running with PID ${owner.pid}. Lock: ${this.lockPath}`);
-      }
-
+    for (let attempt = 0; attempt < 5; attempt++) {
       try {
         this.fd = fs.openSync(this.lockPath, 'wx');
         this.ownerToken = crypto.randomUUID();
@@ -352,18 +393,21 @@ class ProcessLock {
         return;
       } catch (err) {
         if (err.code !== 'EEXIST') throw err;
-        const owner = this.readOwner();
+        let owner;
+        try {
+          owner = this.readOwner();
+        } catch (readErr) {
+          if (readErr.code === 'ENOENT') continue;
+          throw readErr;
+        }
         if (this.removeMalformedLock(owner)) continue;
         if (this.processIsAlive(owner.pid)) {
           throw new Error(`Bot already running with PID ${owner.pid}. Lock: ${this.lockPath}`);
         }
-        throw new Error(
-          `Stale bot lock found for PID ${owner.pid}. ` +
-          `Inspect ${this.lockPath} and remove it manually if no bot is running.`
-        );
+        if (this.removeStaleLock(owner)) continue;
       }
     }
-    throw new Error(`Unable to acquire bot lock after repeated malformed-lock cleanup: ${this.lockPath}`);
+    throw new Error(`Unable to acquire bot lock after repeated stale-lock cleanup: ${this.lockPath}`);
   }
 
   release() {
@@ -1053,7 +1097,11 @@ Be conservative. Protect capital first.
       let decision;
       for (let attempt = 1; attempt <= AI_VALIDATION_RETRIES + 1; attempt++) {
         try {
-          const result = await this.model.generateContent(prompt);
+          const result = await withTimeout(
+            this.model.generateContent(prompt),
+            AI_VALIDATION_TIMEOUT_MS,
+            `Gemini validation timed out after ${AI_VALIDATION_TIMEOUT_MS}ms`
+          );
           decision = this.parseResponse(result.response.text());
           this.applyConfidenceRules(decision);
           if (decision.confidence < AI_MIN_CONFIDENCE) {
@@ -1335,15 +1383,14 @@ class SpotGridEngine {
     const trailingState = direction === 'up'
       ? this.getTrailingUpState(symbol)
       : this.getTrailingDownState(symbol);
+    const offset = direction === 'up' ? -shift.steps : shift.steps;
 
     symState.config.lower = shift.lower;
     symState.config.upper = shift.upper;
-    const offset = direction === 'up' ? -shift.steps : shift.steps;
-    this.shiftStoredLevelIndexes(symbol, offset);
 
     const cleanedBuys = {};
     for (const [idx, buy] of Object.entries(symState.lastBuyByLevel)) {
-      const newIdx = Number(idx);
+      const newIdx = Number(idx) + offset;
       const exitIdx = newIdx < 0
         ? -1
         : newIdx >= GRID_COUNT
@@ -1690,6 +1737,17 @@ class SpotGridEngine {
     if (!GRID_REFILL_ON_FILLED || !aiDecision.allowTrading || !aiDecision.allowSell || levelIndex + 1 >= levels.length) return;
     const sellPrice = levels[levelIndex + 1];
     if (sellableAmount > 0) {
+      const market = this.exchange.markets[symbol];
+      const minCost = Number(market?.limits?.cost?.min || 0);
+      const precisePrice = Number(this.exchange.priceToPrecision(symbol, sellPrice));
+      const preciseAmount = Number(this.exchange.amountToPrecision(symbol, sellableAmount));
+      const notional = preciseAmount * precisePrice;
+      if (minCost > 0 && notional < minCost - 1e-8) {
+        console.warn(
+          `[SKIP] ${symbol} SELL refill level=${levelIndex + 1} | notional ${notional.toFixed(8)} below min ${minCost}, keeping buy record for later retry`
+        );
+        return;
+      }
       await this.placeLimit(symbol, 'sell', levelIndex + 1, sellPrice, sellableAmount);
     } else {
       console.warn(`[SKIP] ${symbol} SELL refill level=${levelIndex + 1} | sellable amount zero after fee`);
@@ -1994,7 +2052,10 @@ class SpotGridEngine {
       let trackedAmount = this.amountForTrackedSell(symbol, level.index);
       if (!(trackedAmount > 0)) continue;
       let amount = Math.min(trackedAmount, baseFree);
-      if (!(amount > 0)) break;
+      if (!(amount > 0)) {
+        console.warn(`[SKIP] ${symbol} SELL level=${level.index} | insufficient free base, checking farther sell levels`);
+        continue;
+      }
       
       const market = this.exchange.markets[symbol];
       const minCost = Number(market?.limits?.cost?.min || 0);
@@ -2005,7 +2066,7 @@ class SpotGridEngine {
       }
       
       const order = await this.placeLimit(symbol, 'sell', level.index, level.price, amount);
-      if (!order) break;
+      if (!order) continue;
       baseFree -= amount;
     }
 
