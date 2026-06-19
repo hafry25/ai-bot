@@ -179,7 +179,11 @@ const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 
 function sleepSync(ms) {
   if (!(ms > 0)) return;
-  // Used only during startup lock acquisition, before the bot begins its async work.
+  // Used only during startup lock acquisition (stale-lock grace period), before the bot
+  // begins its async event loop. The busy-loop fallback is intentional: it runs for at
+  // most BOT_LOCK_STALE_GRACE_MS (default 2 s) and only when SharedArrayBuffer is
+  // unavailable (e.g. missing COOP/COEP headers in some environments). The blast radius
+  // is one short CPU-bound wait at startup — not inside the trading loop.
   try {
     const buffer = new SharedArrayBuffer(4);
     Atomics.wait(new Int32Array(buffer), 0, 0, ms);
@@ -279,6 +283,22 @@ function validateRuntimeConfiguration() {
   requireNonNegative('BOT_LOCK_STALE_GRACE_MS', BOT_LOCK_STALE_GRACE_MS);
   requirePositive('AI_VALIDATION_TIMEOUT_MS', AI_VALIDATION_TIMEOUT_MS);
   requirePositive('FONNTE_TIMEOUT_MS', FONNTE_TIMEOUT_MS);
+
+  if (LEARNING_MEMORY_ENABLED) {
+    requireInteger('LEARNING_MEMORY_MIN_SAMPLES', LEARNING_MEMORY_MIN_SAMPLES, 1);
+    requireInteger('LEARNING_MEMORY_LOOKBACK', LEARNING_MEMORY_LOOKBACK, 1);
+    requireInteger('LEARNING_MEMORY_MAX_RECORDS', LEARNING_MEMORY_MAX_RECORDS, 1);
+    requirePositive('LEARNING_MEMORY_RECENCY_HALF_LIFE_HOURS',
+      Config.number('LEARNING_MEMORY_RECENCY_HALF_LIFE_HOURS', 24));
+    requireNonNegative('LEARNING_MEMORY_OUTCOME_DELAY_MS', LEARNING_MEMORY_OUTCOME_DELAY_MS);
+    requireNonNegative('LEARNING_MEMORY_PROFIT_THRESHOLD_PCT', LEARNING_MEMORY_PROFIT_THRESHOLD_PCT);
+    if (LEARNING_MEMORY_MIN_SAMPLES > LEARNING_MEMORY_LOOKBACK) {
+      errors.push(
+        `LEARNING_MEMORY_MIN_SAMPLES (${LEARNING_MEMORY_MIN_SAMPLES}) must be <= ` +
+        `LEARNING_MEMORY_LOOKBACK (${LEARNING_MEMORY_LOOKBACK})`
+      );
+    }
+  }
 
   const hasLower = GRID_LOWER_PRICE > 0;
   const hasUpper = GRID_UPPER_PRICE > 0;
@@ -978,9 +998,10 @@ class AIGridValidator {
       decision.allowSell = false;
       decision.reason = `Auto-blocked: confidence too low (${conf.toFixed(1)}%) - extreme uncertainty`;
     } else if (conf < 70) {
-      // Elevated caution: only allow the side(s) the model explicitly approved.
-      // (Previously this only re-applied an already-blocked allowTrading state,
-      // so the medium-confidence tier had no real effect.)
+      // Medium-confidence tier: apply allowTrading mask to both sides so that if the
+      // AI already set allowTrading=false, buys and sells are both blocked. When
+      // allowTrading=true but we're in a moderate-confidence band, preserve whatever
+      // directional signal the AI gave (allowBuy / allowSell already reflect trend bias).
       decision.allowBuy = decision.allowTrading && decision.allowBuy;
       decision.allowSell = decision.allowTrading && decision.allowSell;
     }
@@ -1036,6 +1057,9 @@ class AIGridValidator {
     const entry = AIGridValidator.lastDecisionBySymbol.get(symbol);
     if (!entry) return null;
     const age = Date.now() - entry.at;
+    // allowStale=true is used during Gemini rate-limit backoff so the bot can continue
+    // operating on the last known decision rather than blocking all trading entirely.
+    // It intentionally bypasses the TTL — callers must document that they accept stale data.
     if (allowStale || age < AI_VALIDATION_CACHE_TTL_MS) return entry;
     return null;
   }
@@ -1297,6 +1321,8 @@ class SpotGridEngine {
     this.aiValidator = new AIGridValidator(this.exchange);
     this.state = new GridState();
     this.isRunning = false;
+    // Per-symbol async mutex — ensures only one reconcileSymbol() runs per symbol at a time
+    // even if a slow exchange call causes the interval timer to fire again mid-cycle.
     this.symbolLocks = new Map();
     this.pendingOrderLevels = new Set();
     this.rangeResetSymbols = new Set();
@@ -1993,7 +2019,7 @@ class SpotGridEngine {
 
     // If a sell order is already active at this level, check whether its amount needs updating
     if (this.hasActiveOrderAtLevel(symState, 'sell', sellLevelIndex)) {
-      // Cari order aktif di level ini
+      // Find the existing active order at this level
       const existingOrder = Object.values(symState.orders).find(o =>
         String(o.side).toLowerCase() === 'sell' && Number(o.levelIndex) === sellLevelIndex
       );
@@ -2069,10 +2095,15 @@ class SpotGridEngine {
     const remainingSellable = sellableAtBuy - amount;
     if (remainingSellable > 0) {
       const newProportion = remainingSellable / sellableAtBuy;
-      buy.sellableAmount = remainingSellable;
-      buy.totalCostQuote = buy.totalCostQuote * newProportion;
-      buy.totalFeeQuote = buy.totalFeeQuote * newProportion;
-      buy.amount = remainingSellable;
+      // Spread to a new object before mutating so that callers holding a reference
+      // to the old buy object don't observe unexpected mutations.
+      symState.lastBuyByLevel[buyLevelIndex] = {
+        ...buy,
+        sellableAmount: remainingSellable,
+        totalCostQuote: buy.totalCostQuote * newProportion,
+        totalFeeQuote: buy.totalFeeQuote * newProportion,
+        amount: remainingSellable,
+      };
     } else {
       delete symState.lastBuyByLevel[buyLevelIndex];
     }
@@ -2143,8 +2174,19 @@ class SpotGridEngine {
       if (trades.length < TRADE_FETCH_LIMIT) break;
       // CCXT pagination is timestamp-based here; if many fills share one timestamp,
       // processedTrade() handles duplicates but the exchange may not expose a stable
-      // cursor for every trade in that timestamp bucket.
-      if (lastTimestamp === from) break;
+      // cursor for every trade in that timestamp bucket. We log a warning so operators
+      // can detect high-volume conditions where fills might be missed in a bucket.
+      if (lastTimestamp === from) {
+        if (trades.length >= TRADE_FETCH_LIMIT) {
+          console.warn(
+            `[TRADES] ${symbol} pagination stopped: full page (${TRADE_FETCH_LIMIT}) of trades share ` +
+            `timestamp ${lastTimestamp}. Fills within this timestamp bucket may be partially missed. ` +
+            `processedTrade() deduplication handles re-seen fills, but unseen fills in this bucket ` +
+            `will be picked up on the next cycle if they appear in a subsequent fetch window.`
+          );
+        }
+        break;
+      }
       from = lastTimestamp + 1;
       iteration++;
       await sleep(200);
@@ -2183,7 +2225,7 @@ class SpotGridEngine {
       }
     }
     // Clean up local state for orders that no longer exist on the exchange
-    // (mis. dihapus manual, cancelled di luar bot, dll.)
+    // (e.g. deleted manually, cancelled outside the bot, etc.)
     // IMPORTANT: run this AFTER processing trades above, otherwise a buy order
     // that just got fully filled (and thus disappeared from openOrders) would
     // get its local state wiped before handleBuyFill() can place the sell order.
