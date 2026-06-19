@@ -933,7 +933,11 @@ class AIGridValidator {
       decision.allowSell = false;
       decision.reason = `Auto-blocked: confidence too low (${conf.toFixed(1)}%) - extreme uncertainty`;
     } else if (conf < 70) {
-      if (!decision.allowTrading) decision.allowBuy = decision.allowSell = false;
+      // Elevated caution: only allow the side(s) the model explicitly approved.
+      // (Previously this only re-applied an already-blocked allowTrading state,
+      // so the medium-confidence tier had no real effect.)
+      decision.allowBuy = decision.allowTrading && decision.allowBuy;
+      decision.allowSell = decision.allowTrading && decision.allowSell;
     }
     return decision;
   }
@@ -1123,8 +1127,10 @@ Be conservative. Protect capital first.
 
     const { ignoreMinInterval = false } = options;
     const cacheKey = this.cacheKey(symbol, context.currentPrice, context.levels);
-    const cached = this.getCached(cacheKey);
-    if (cached) return cached;
+    if (!ignoreMinInterval) {
+      const cached = this.getCached(cacheKey);
+      if (cached) return cached;
+    }
 
     const lastDecision = this.getLastDecisionEntry(symbol);
     if (!ignoreMinInterval && lastDecision && Date.now() - lastDecision.at < AI_VALIDATION_MIN_INTERVAL_MS) {
@@ -2144,7 +2150,7 @@ class SpotGridEngine {
     if (GRID_CANCEL_OUT_OF_RANGE) {
       const recentThresholdMs = GRID_CANCEL_OUT_OF_RANGE_THRESHOLD_MS;
       for (const order of managedOrders) {
-        const orderTimestamp = Date.parse(order.timestamp || order.datetime || 0);
+        const orderTimestamp = Number(order.timestamp) || Date.parse(order.datetime || 0) || 0;
         const orderAgeMs = Date.now() - orderTimestamp;
         if (orderAgeMs < recentThresholdMs) continue;
         const isValidGridOrder = this.isOrderCloseToPriceLevel(order.price, levels, this.exchange.markets[symbol]);
