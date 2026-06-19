@@ -1817,29 +1817,61 @@ class SpotGridEngine {
     this.state.markProcessedTrade(symbol, this.getTradeId(trade));
     await this.sendAlert(`[GRID BUY] ${symbol} amount=${amount} @ ${price} | sellable=${sellableAmount} | fee=${feeQuote.toFixed(4)} ${quote}`);
     if (!GRID_REFILL_ON_FILLED || !aiDecision.allowTrading || !aiDecision.allowSell || levelIndex + 1 >= levels.length) return;
-    const sellPrice = levels[levelIndex + 1];
-    if (this.hasActiveOrderAtLevel(symState, 'sell', levelIndex + 1)) {
-      console.warn(`[SKIP] ${symbol} SELL refill level=${levelIndex + 1} | sell order already active`);
+    const sellLevelIndex = levelIndex + 1;
+    const sellPrice = levels[sellLevelIndex];
+
+    // Ambil total sellable amount dari lastBuyByLevel (sudah digabung oleh mergeBuyRecords)
+    const totalSellable = Math.max(0, Number(symState.lastBuyByLevel[levelIndex]?.sellableAmount ?? symState.lastBuyByLevel[levelIndex]?.amount) || 0);
+    if (!(totalSellable > 0)) {
+      console.warn(`[SKIP] ${symbol} SELL refill level=${sellLevelIndex} | sellable amount zero after fee`);
       return;
     }
-    if (this.countActiveOrders(symState, 'sell') >= GRID_MAX_ACTIVE_SELL_ORDERS) {
-      console.warn(`[SKIP] ${symbol} SELL refill level=${levelIndex + 1} | active sell order limit reached`);
+
+    const market = this.exchange.markets[symbol];
+    const minCost = Number(market?.limits?.cost?.min || 0);
+    const { notional } = this.getPreciseOrderNumbers(symbol, sellPrice, totalSellable);
+    if (minCost > 0 && notional < minCost - 1e-8) {
+      console.warn(
+        `[SKIP] ${symbol} SELL refill level=${sellLevelIndex} | notional ${notional.toFixed(8)} below min ${minCost}, keeping buy record for later retry`
+      );
       return;
     }
-    if (sellableAmount > 0) {
-      const market = this.exchange.markets[symbol];
-      const minCost = Number(market?.limits?.cost?.min || 0);
-      const { notional } = this.getPreciseOrderNumbers(symbol, sellPrice, sellableAmount);
-      if (minCost > 0 && notional < minCost - 1e-8) {
-        console.warn(
-          `[SKIP] ${symbol} SELL refill level=${levelIndex + 1} | notional ${notional.toFixed(8)} below min ${minCost}, keeping buy record for later retry`
+
+    // Jika sell order sudah aktif di level ini, cek apakah amount-nya perlu diupdate
+    if (this.hasActiveOrderAtLevel(symState, 'sell', sellLevelIndex)) {
+      // Cari order aktif di level ini
+      const existingOrder = Object.values(symState.orders).find(o =>
+        String(o.side).toLowerCase() === 'sell' && Number(o.levelIndex) === sellLevelIndex
+      );
+      const existingAmount = Number(existingOrder?.amount || 0);
+
+      // Hitung selisih: berapa amount baru yang perlu ditambahkan
+      const { preciseAmount: preciseTotalSellable } = this.getPreciseOrderNumbers(symbol, sellPrice, totalSellable);
+      const preciseTotalNum = Number(preciseTotalSellable);
+
+      if (existingOrder && preciseTotalNum > existingAmount + 1e-8) {
+        // Ada kelebihan amount dari buy baru — cancel order lama, pasang ulang dengan amount total
+        console.log(
+          `[UPDATE] ${symbol} SELL level=${sellLevelIndex} | amount update ${existingAmount} -> ${preciseTotalNum} (buy accumulated)`
         );
-        return;
+        try {
+          await this.cancelOrder(symbol, existingOrder, `sell amount update level=${sellLevelIndex}`);
+          await this.placeLimit(symbol, 'sell', sellLevelIndex, sellPrice, totalSellable);
+        } catch (err) {
+          console.warn(`[UPDATE] ${symbol} SELL level=${sellLevelIndex} cancel+replace failed: ${err.message}`);
+        }
+      } else {
+        console.warn(`[SKIP] ${symbol} SELL refill level=${sellLevelIndex} | sell order already active with sufficient amount`);
       }
-      await this.placeLimit(symbol, 'sell', levelIndex + 1, sellPrice, sellableAmount);
-    } else {
-      console.warn(`[SKIP] ${symbol} SELL refill level=${levelIndex + 1} | sellable amount zero after fee`);
+      return;
     }
+
+    if (this.countActiveOrders(symState, 'sell') >= GRID_MAX_ACTIVE_SELL_ORDERS) {
+      console.warn(`[SKIP] ${symbol} SELL refill level=${sellLevelIndex} | active sell order limit reached`);
+      return;
+    }
+
+    await this.placeLimit(symbol, 'sell', sellLevelIndex, sellPrice, totalSellable);
   }
 
   async handleSellFill(symbol, levels, aiDecision, symState, trade, orderMeta, openOrderIds) {
