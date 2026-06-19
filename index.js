@@ -2038,9 +2038,6 @@ class SpotGridEngine {
       retry(() => this.exchange.fetchOpenOrders(symbol)),
     ]);
     const openOrderIds = new Set(openOrders.map(order => String(order.id)));
-    // Clean up local state for orders that no longer exist on the exchange
-    // (mis. dihapus manual, cancelled di luar bot, dll.)
-    this.syncManagedOrdersWithExchange(symbol, symState, openOrderIds);
     for (const trade of trades.sort((a, b) => a.timestamp - b.timestamp)) {
       const id = this.getTradeId(trade);
       if (this.state.processedTrade(symbol, id)) continue;
@@ -2059,6 +2056,12 @@ class SpotGridEngine {
         this.state.markProcessedTrade(symbol, id);
       }
     }
+    // Clean up local state for orders that no longer exist on the exchange
+    // (mis. dihapus manual, cancelled di luar bot, dll.)
+    // IMPORTANT: run this AFTER processing trades above, otherwise a buy order
+    // that just got fully filled (and thus disappeared from openOrders) would
+    // get its local state wiped before handleBuyFill() can place the sell order.
+    this.syncManagedOrdersWithExchange(symbol, symState, openOrderIds);
   }
 
   async enforceRangeExits(symbol, currentPrice) {
