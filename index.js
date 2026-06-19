@@ -65,6 +65,8 @@ const GRID_LOWER_PRICE = Config.number('GRID_LOWER_PRICE', 0);
 const GRID_UPPER_PRICE = Config.number('GRID_UPPER_PRICE', 0);
 const GRID_RANGE_PCT = Config.number('GRID_RANGE_PCT', 5);
 const GRID_RESET_RANGE_ON_START = Config.boolean('GRID_RESET_RANGE_ON_START', false);
+const GRID_STALE_RANGE_DEVIATION_PCT = Config.number('GRID_STALE_RANGE_DEVIATION_PCT', 50);
+const GRID_STALE_RANGE_AUTO_RESET = Config.boolean('GRID_STALE_RANGE_AUTO_RESET', false);
 const GRID_TRAILING_RANGE_ENABLED = Config.boolean('GRID_TRAILING_RANGE_ENABLED', false);
 const GRID_TRAILING_UP_ENABLED = Config.boolean('GRID_TRAILING_UP_ENABLED', GRID_TRAILING_RANGE_ENABLED);
 const GRID_TRAILING_UP_COOLDOWN_MS = Math.max(Config.number('GRID_TRAILING_UP_COOLDOWN_MINUTES', 0), 0) * MINUTE_MS;
@@ -131,6 +133,11 @@ const LEARNING_MEMORY_RECENCY_HALF_LIFE_MS = Math.max(
 ) * 60 * 60 * 1000;
 const LEARNING_MEMORY_MAX_RECORDS = Config.number('LEARNING_MEMORY_MAX_RECORDS', 2000);
 const LEARNING_MEMORY_PROFIT_THRESHOLD_PCT = Config.number('LEARNING_MEMORY_PROFIT_THRESHOLD_PCT', 0.5);
+const LEARNING_MEMORY_EXPLORE_AFTER_BLOCKS = Config.number('LEARNING_MEMORY_EXPLORE_AFTER_BLOCKS', 20);
+const LEARNING_MEMORY_EXPLORE_COOLDOWN_MS = Math.max(
+  Config.number('LEARNING_MEMORY_EXPLORE_COOLDOWN_MINUTES', 60),
+  0
+) * MINUTE_MS;
 // ---------------------------------------
 
 const MAX_PROCESSED_TRADE_IDS = 2000;
@@ -908,10 +915,48 @@ class AIGridValidator {
     } else {
       this.learningMemory = null;
     }
+    // Tracks consecutive memory-driven blocks per symbol, and when we last allowed an
+    // "explore" trade despite a memory-driven block. See shouldExploreDespiteMemoryBlock().
+    this.memoryBlockStreak = new Map();
+    this.lastExploreAt = new Map();
   }
 
   static allow(reason = 'AI validation disabled') {
     return { allowTrading: true, allowBuy: true, allowSell: true, confidence: 100, reason };
+  }
+
+  // Anti death-spiral safeguard for the learning memory feature.
+  //
+  // Problem: if memory pushes confidence below AI_MIN_CONFIDENCE and trading is blocked,
+  // no new trade happens for that situation -> no new outcome data is generated for it ->
+  // the model never gets fresh evidence that conditions may have improved -> the same
+  // memory-driven block keeps reinforcing itself indefinitely.
+  //
+  // Fix: after LEARNING_MEMORY_EXPLORE_AFTER_BLOCKS consecutive memory-driven blocks for a
+  // symbol (subject to a cooldown so we don't explore every cycle), allow one trade through
+  // anyway so the memory store gets a fresh, real outcome to learn from. This intentionally
+  // does NOT bypass STOP_LOSS/TAKE_PROFIT/kill-switch/circuit-breaker -- only the
+  // memory-driven confidence penalty.
+  shouldExploreDespiteMemoryBlock(symbol) {
+    if (LEARNING_MEMORY_EXPLORE_AFTER_BLOCKS <= 0) return false;
+    const streak = this.memoryBlockStreak.get(symbol) || 0;
+    if (streak < LEARNING_MEMORY_EXPLORE_AFTER_BLOCKS) return false;
+    const lastExplore = this.lastExploreAt.get(symbol) || 0;
+    if (Date.now() - lastExplore < LEARNING_MEMORY_EXPLORE_COOLDOWN_MS) return false;
+    return true;
+  }
+
+  recordMemoryBlockOutcome(symbol, wasMemoryBlocked, didExplore) {
+    if (didExplore) {
+      this.memoryBlockStreak.set(symbol, 0);
+      this.lastExploreAt.set(symbol, Date.now());
+      return;
+    }
+    if (wasMemoryBlocked) {
+      this.memoryBlockStreak.set(symbol, (this.memoryBlockStreak.get(symbol) || 0) + 1);
+    } else {
+      this.memoryBlockStreak.set(symbol, 0);
+    }
   }
 
   static block(reason, confidence = 0) {
@@ -1189,6 +1234,8 @@ Be conservative. Protect capital first.
         const features = this.learningMemory.enrichContext(context, candleSummary);
         features.symbol = symbol;
         const queryResult = this.learningMemory.querySimilarWithFeatures(features);
+        let wasMemoryBlocked = false;
+        let didExplore = false;
         if (queryResult && queryResult.samples >= LEARNING_MEMORY_MIN_SAMPLES) {
           const successRatio = Number.isFinite(queryResult.weightedRatio) ? queryResult.weightedRatio : queryResult.ratio;
           const factor = 0.85 + (successRatio * 0.3);
@@ -1202,14 +1249,26 @@ Be conservative. Protect capital first.
             `-> confidence ${oldConfidence.toFixed(1)} -> ${decision.confidence.toFixed(1)} (factor=${factor.toFixed(2)})`
           );
           if (decision.confidence < AI_MIN_CONFIDENCE) {
-            decision = AIGridValidator.block(
-              `Low AI confidence after memory adjustment: ${decision.reason}`,
-              decision.confidence
-            );
-            decision.allowBuy = false;
-            decision.allowSell = false;
+            wasMemoryBlocked = true;
+            if (this.shouldExploreDespiteMemoryBlock(symbol)) {
+              didExplore = true;
+              console.warn(
+                `[MEMORY] ${symbol} forcing an exploratory trade after ` +
+                `${this.memoryBlockStreak.get(symbol)} consecutive memory-driven blocks, ` +
+                `to avoid a permanent self-reinforcing block (LEARNING_MEMORY_EXPLORE_AFTER_BLOCKS=${LEARNING_MEMORY_EXPLORE_AFTER_BLOCKS}).`
+              );
+              decision.reason += ' | Memory: exploratory trade allowed to refresh stale block';
+            } else {
+              decision = AIGridValidator.block(
+                `Low AI confidence after memory adjustment: ${decision.reason}`,
+                decision.confidence
+              );
+              decision.allowBuy = false;
+              decision.allowSell = false;
+            }
           }
         }
+        this.recordMemoryBlockOutcome(symbol, wasMemoryBlocked, didExplore);
         this.learningMemory.recordDecision(symbol, context, decision, profit, features);
         this.setCached(cacheKey, decision);
         this.rememberDecision(symbol, decision);
@@ -1249,6 +1308,7 @@ class SpotGridEngine {
     for (const symbol of SYMBOLS) {
       try {
         this.ensureMarket(symbol);
+        this.warnIfPerGridSizeBelowMinCost(symbol);
         if (GRID_RECREATE_ON_START) await this.cancelGridOrders(symbol, 'recreate-on-start');
         await this.reconcileSymbol(symbol);
       } catch (err) {
@@ -1256,6 +1316,23 @@ class SpotGridEngine {
         this.recordError();
       }
     }
+  }
+
+  // Proactively check at startup whether the configured per-grid order size can ever
+  // satisfy this symbol's exchange minimum notional. validateRuntimeConfiguration() only
+  // compares GRID_TOTAL_INVESTMENT_USDT/GRID_COUNT against GRID_ORDER_SIZE_USDT, which does
+  // NOT know the exchange's actual per-symbol minCost -- so this gap can otherwise pass
+  // validation and only surface as a silent, permanent "investment cap reached" skip later.
+  warnIfPerGridSizeBelowMinCost(symbol) {
+    const minCost = this.getMinCost(symbol);
+    if (!(minCost > 0)) return;
+    const perGridSize = this.getOrderSizeUsdt();
+    if (perGridSize >= minCost) return;
+    console.warn(
+      `[CONFIG] ${symbol} per-grid order size ${roundNumber(perGridSize, 8)} USDT is below this symbol's ` +
+      `exchange minimum order cost ${minCost} USDT. Some buy levels may never be able to place an order. ` +
+      `Consider lowering GRID_COUNT or raising GRID_TOTAL_INVESTMENT_USDT/GRID_ORDER_SIZE_USDT.`
+    );
   }
 
   ensureMarket(symbol) {
@@ -1294,18 +1371,53 @@ class SpotGridEngine {
     return Math.max(0.1, this.getOrderSizeUsdt() * (LEARNING_MEMORY_PROFIT_THRESHOLD_PCT / 100));
   }
 
+  isStoredRangeStale(symbol, currentPrice, lower, upper) {
+    if (!(lower > 0) || !(upper > 0) || !(currentPrice > 0)) return false;
+    if (currentPrice >= lower && currentPrice <= upper) return false;
+    const distance = currentPrice < lower ? (lower - currentPrice) : (currentPrice - upper);
+    const rangeSize = upper - lower;
+    const deviationPct = rangeSize > 0 ? (distance / rangeSize) * 100 : Infinity;
+    if (deviationPct <= GRID_STALE_RANGE_DEVIATION_PCT) return false;
+    console.warn(
+      `[RANGE] ${symbol} stored range ${roundNumber(lower)}-${roundNumber(upper)} is stale: ` +
+      `current price ${roundNumber(currentPrice)} is ${roundNumber(deviationPct, 1)}% outside the range ` +
+      `(threshold ${GRID_STALE_RANGE_DEVIATION_PCT}%).`
+    );
+    return true;
+  }
+
   buildRange(symbol, currentPrice) {
     const symState = this.state.getSymbol(symbol);
     const manualRange = hasManualGridRange();
+    let storedLower = Number(symState.config.lower) || 0;
+    let storedUpper = Number(symState.config.upper) || 0;
+
+    if (!manualRange && storedLower > 0 && storedUpper > 0) {
+      const stale = this.isStoredRangeStale(symbol, currentPrice, storedLower, storedUpper);
+      if (stale) {
+        if (GRID_STALE_RANGE_AUTO_RESET) {
+          console.warn(`[RANGE] ${symbol} auto-resetting stale range around current price (GRID_STALE_RANGE_AUTO_RESET=true).`);
+          storedLower = 0;
+          storedUpper = 0;
+        } else {
+          console.warn(
+            `[RANGE] ${symbol} keeping stale stored range because GRID_STALE_RANGE_AUTO_RESET=false. ` +
+            `Set GRID_STALE_RANGE_AUTO_RESET=true to auto re-center, or set GRID_RESET_RANGE_ON_START=true, ` +
+            `or clear ${GRID_STATE_FILE} manually if this range no longer reflects the market.`
+          );
+        }
+      }
+    }
+
     const resetAutoRange = !manualRange &&
       GRID_RESET_RANGE_ON_START &&
       !(this.rangeResetSymbols && this.rangeResetSymbols.has(symbol));
     const lower = manualRange
       ? GRID_LOWER_PRICE
-      : Number((resetAutoRange ? 0 : symState.config.lower) || currentPrice * (1 - GRID_RANGE_PCT / 100));
+      : (resetAutoRange ? 0 : storedLower) || currentPrice * (1 - GRID_RANGE_PCT / 100);
     const upper = manualRange
       ? GRID_UPPER_PRICE
-      : Number((resetAutoRange ? 0 : symState.config.upper) || currentPrice * (1 + GRID_RANGE_PCT / 100));
+      : (resetAutoRange ? 0 : storedUpper) || currentPrice * (1 + GRID_RANGE_PCT / 100);
     if (lower <= 0 || upper <= 0 || lower >= upper) {
       throw new Error(`Invalid grid range. lower=${lower}, upper=${upper}`);
     }
@@ -1413,8 +1525,17 @@ class SpotGridEngine {
     symState.lastBuyByLevel = shiftedBuys;
   }
 
-  mergeBuyRecords(existing, incoming) {
-    if (!existing) return { ...incoming };
+  // Merges two buy records into a weighted-average position. This is mathematically
+  // correct for overall cost-basis accounting, but when called from a trailing shift to
+  // collapse multiple original grid levels into one boundary level, the resulting price/
+  // level association no longer reflects any single real fill. We mark the merged record
+  // so downstream consumers (logs, reports) know its per-level price is now an aggregate,
+  // not a single fill price -- total realized profit accounting is unaffected since that
+  // is always derived from actual trade fills, not from this aggregated record.
+  mergeBuyRecords(existing, incoming, { aggregatedAcrossLevels = false } = {}) {
+    if (!existing) {
+      return aggregatedAcrossLevels ? { ...incoming, aggregated: true } : { ...incoming };
+    }
     const existingAmount = Number(existing.amount) || 0;
     const incomingAmount = Number(incoming.amount) || 0;
     const amount = existingAmount + incomingAmount;
@@ -1431,6 +1552,7 @@ class SpotGridEngine {
       totalCostQuote,
       totalFeeQuote,
       at: Date.parse(incoming.at || 0) > Date.parse(existing.at || 0) ? incoming.at : existing.at,
+      aggregated: aggregatedAcrossLevels || existing.aggregated === true || incoming.aggregated === true,
     };
   }
 
@@ -1494,10 +1616,14 @@ class SpotGridEngine {
     for (const [idx, buy] of Object.entries(symState.lastBuyByLevel)) {
       const newIdx = Number(idx) + offset;
       const exitIdx = this.clampBuyLevelIndex(newIdx);
-      cleanedBuys[exitIdx] = this.mergeBuyRecords(cleanedBuys[exitIdx], buy);
+      const collapsedAcrossLevels = exitIdx !== newIdx || Boolean(cleanedBuys[exitIdx]);
+      cleanedBuys[exitIdx] = this.mergeBuyRecords(cleanedBuys[exitIdx], buy, {
+        aggregatedAcrossLevels: collapsedAcrossLevels,
+      });
       if (exitIdx !== newIdx) {
         console.warn(
-          `[TRAILING] Keeping buy at shifted level ${newIdx} as boundary buy level ${exitIdx} after ${direction} shift`
+          `[TRAILING] Keeping buy at shifted level ${newIdx} as boundary buy level ${exitIdx} after ${direction} shift. ` +
+          `This level's stored price is now a weighted average across collapsed levels, not a single fill price.`
         );
       }
     }
@@ -2292,9 +2418,31 @@ class SpotGridEngine {
     const minCost = this.getMinCost(symbol);
     const targetNotional = Math.max(this.getOrderSizeUsdt(), minCost);
     const notional = Math.min(targetNotional, availableInvestmentUsdt);
-    if (minCost > 0 && notional < minCost - 1e-8) return 0;
+    if (minCost > 0 && notional < minCost - 1e-8) {
+      this.warnIfInvestmentPermanentlyStuck(symbol, availableInvestmentUsdt, minCost);
+      return 0;
+    }
     if (!(notional > 0)) return 0;
     return notional / price;
+  }
+
+  // GRID_TOTAL_INVESTMENT_USDT can leave a small leftover (e.g. $3) that is below the
+  // exchange's minimum order cost (e.g. $5). When that happens, this remaining amount
+  // can NEVER be used to place a buy order again until profit from a sell adds more
+  // funds back in -- it is not a transient "cap reached" state, it is permanently stuck.
+  // We warn loudly (once per symbol) so this isn't mistaken for ordinary cap-reached skips.
+  warnIfInvestmentPermanentlyStuck(symbol, availableInvestmentUsdt, minCost) {
+    if (!(GRID_TOTAL_INVESTMENT_USDT > 0)) return;
+    if (!(availableInvestmentUsdt > 0) || availableInvestmentUsdt >= minCost) return;
+    if (!this.stuckInvestmentWarned) this.stuckInvestmentWarned = new Set();
+    if (this.stuckInvestmentWarned.has(symbol)) return;
+    this.stuckInvestmentWarned.add(symbol);
+    console.warn(
+      `[CONFIG] ${symbol} remaining investment ${roundNumber(availableInvestmentUsdt, 8)} USDT is below the ` +
+      `exchange minimum order cost ${minCost} USDT. This leftover is PERMANENTLY stuck and cannot be used for ` +
+      `new buy orders until a sell adds funds back. Consider lowering GRID_COUNT, raising ` +
+      `GRID_TOTAL_INVESTMENT_USDT, or accepting fewer active buy levels.`
+    );
   }
 
   isOrderInsideRange(order, lower, upper) {
