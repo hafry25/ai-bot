@@ -2191,6 +2191,10 @@ class SpotGridEngine {
 
     for (const level of below) {
       if (!aiDecision.allowTrading || !aiDecision.allowBuy) break;
+      if (this.countActiveOrders(this.state.getSymbol(symbol), 'buy') >= GRID_MAX_ACTIVE_BUY_ORDERS) {
+        console.warn(`[SKIP] ${symbol} BUY level=${level.index} | active buy order limit (${GRID_MAX_ACTIVE_BUY_ORDERS}) reached`);
+        break;
+      }
       if (activeBuyLevels.has(level.index)) continue;
       let amount = this.amountForBuy(symbol, level.price, remainingInvestmentUsdt);
       let cost = amount * level.price;
