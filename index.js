@@ -1707,8 +1707,7 @@ class SpotGridEngine {
       }
 
       if (side === 'sell') {
-        const market = this.exchange.markets[symbol];
-        const minCost = Number(market?.limits?.cost?.min || 0);
+        const minCost = this.getMinCost(symbol);
         if (minCost > 0 && notional < minCost - 1e-8) {
           console.warn(`[SKIP] ${symbol} SELL level=${levelIndex} | notional ${notional.toFixed(8)} below min ${minCost}, skipping order (dust)`);
           return null;
@@ -1778,6 +1777,11 @@ class SpotGridEngine {
     return symbol.split('/')[1].split(':')[0];
   }
 
+  getMinCost(symbol) {
+    const market = this.exchange.markets[symbol];
+    return Number(market?.limits?.cost?.min || 0);
+  }
+
   getTradeFeeCurrency(trade) {
     return String(trade.fee?.currency || trade.info?.commissionAsset || '').toUpperCase();
   }
@@ -1797,7 +1801,7 @@ class SpotGridEngine {
     let cleaned = 0;
     for (const orderId of Object.keys(symState.orders)) {
       if (!openOrderIds.has(orderId)) {
-        // Order tidak ada di exchange (sudah filled, cancelled, atau dihapus manual)
+        // Order is gone from the exchange (filled, cancelled, or removed manually)
         delete symState.orders[orderId];
         cleaned++;
       }
@@ -1841,15 +1845,14 @@ class SpotGridEngine {
     const sellLevelIndex = levelIndex + 1;
     const sellPrice = levels[sellLevelIndex];
 
-    // Ambil total sellable amount dari lastBuyByLevel (sudah digabung oleh mergeBuyRecords)
+    // Total sellable amount from lastBuyByLevel (already merged by mergeBuyRecords)
     const totalSellable = Math.max(0, Number(symState.lastBuyByLevel[levelIndex]?.sellableAmount ?? symState.lastBuyByLevel[levelIndex]?.amount) || 0);
     if (!(totalSellable > 0)) {
       console.warn(`[SKIP] ${symbol} SELL refill level=${sellLevelIndex} | sellable amount zero after fee`);
       return;
     }
 
-    const market = this.exchange.markets[symbol];
-    const minCost = Number(market?.limits?.cost?.min || 0);
+    const minCost = this.getMinCost(symbol);
     const { notional } = this.getPreciseOrderNumbers(symbol, sellPrice, totalSellable);
     if (minCost > 0 && notional < minCost - 1e-8) {
       console.warn(
@@ -1858,11 +1861,11 @@ class SpotGridEngine {
       return;
     }
 
-    // Sync state lokal dengan exchange sebelum cek hasActiveOrderAtLevel
-    // agar order yang dihapus manual tidak menghalangi pemasangan ulang
+    // Sync local state with the exchange before checking hasActiveOrderAtLevel,
+    // so a manually removed order doesn't block re-placement
     this.syncManagedOrdersWithExchange(symbol, symState, openOrderIds);
 
-    // Jika sell order sudah aktif di level ini, cek apakah amount-nya perlu diupdate
+    // If a sell order is already active at this level, check whether its amount needs updating
     if (this.hasActiveOrderAtLevel(symState, 'sell', sellLevelIndex)) {
       // Cari order aktif di level ini
       const existingOrder = Object.values(symState.orders).find(o =>
@@ -1870,12 +1873,12 @@ class SpotGridEngine {
       );
       const existingAmount = Number(existingOrder?.amount || 0);
 
-      // Hitung selisih: berapa amount baru yang perlu ditambahkan
+      // Work out the difference: how much new amount needs to be added
       const { preciseAmount: preciseTotalSellable } = this.getPreciseOrderNumbers(symbol, sellPrice, totalSellable);
       const preciseTotalNum = Number(preciseTotalSellable);
 
       if (existingOrder && preciseTotalNum > existingAmount + 1e-8) {
-        // Ada kelebihan amount dari buy baru — cancel order lama, pasang ulang dengan amount total
+        // New buy added extra amount — cancel the old order and re-place with the total amount
         console.log(
           `[UPDATE] ${symbol} SELL level=${sellLevelIndex} | amount update ${existingAmount} -> ${preciseTotalNum} (buy accumulated)`
         );
@@ -1968,8 +1971,7 @@ class SpotGridEngine {
         console.warn(`[SKIP] ${symbol} BUY refill level=${levelIndex - 1} | investment cap reached`);
         return;
       }
-      const market = this.exchange.markets[symbol];
-      const minCost = Number(market?.limits?.cost?.min || 0);
+      const minCost = this.getMinCost(symbol);
       if (minCost > 0 && cost < minCost - 1e-8) {
         amountToBuy = minCost / buyPrice;
         cost = amountToBuy * buyPrice;
@@ -2036,7 +2038,7 @@ class SpotGridEngine {
       retry(() => this.exchange.fetchOpenOrders(symbol)),
     ]);
     const openOrderIds = new Set(openOrders.map(order => String(order.id)));
-    // Bersihkan state lokal dari order yang sudah tidak ada di exchange
+    // Clean up local state for orders that no longer exist on the exchange
     // (mis. dihapus manual, cancelled di luar bot, dll.)
     this.syncManagedOrdersWithExchange(symbol, symState, openOrderIds);
     for (const trade of trades.sort((a, b) => a.timestamp - b.timestamp)) {
@@ -2170,8 +2172,8 @@ class SpotGridEngine {
       if (order.side === 'buy') activeBuyLevels.add(idx);
       if (order.side === 'sell') activeSellLevels.add(idx);
     }
-    // Tambahkan semua order dari state lokal ke activeLevels agar tidak double-place,
-    // termasuk order lama yang masih aktif di exchange
+    // Add all orders from local state into activeLevels to avoid double-placing,
+    // including older orders that are still active on the exchange
     for (const order of Object.values(this.state.getSymbol(symbol).orders)) {
       if (order.side === 'buy') activeBuyLevels.add(Number(order.levelIndex));
       if (order.side === 'sell') activeSellLevels.add(Number(order.levelIndex));
@@ -2194,8 +2196,7 @@ class SpotGridEngine {
         break;
       }
       
-      const market = this.exchange.markets[symbol];
-      const minCost = Number(market?.limits?.cost?.min || 0);
+      const minCost = this.getMinCost(symbol);
       if (minCost > 0 && cost < minCost - 1e-8) {
         const requiredAmount = minCost / level.price;
         amount = this.exchange.amountToPrecision(symbol, requiredAmount);
@@ -2236,8 +2237,7 @@ class SpotGridEngine {
         continue;
       }
       
-      const market = this.exchange.markets[symbol];
-      const minCost = Number(market?.limits?.cost?.min || 0);
+      const minCost = this.getMinCost(symbol);
       const notional = amount * level.price;
       if (minCost > 0 && notional < minCost - 1e-8) {
         console.warn(`[SKIP] ${symbol} SELL level=${level.index} | notional too low (dust), keeping buy record for later retry`);
@@ -2282,8 +2282,7 @@ class SpotGridEngine {
   }
 
   amountForBuy(symbol, price, availableInvestmentUsdt = this.getRemainingInvestmentUsdt(symbol)) {
-    const market = this.exchange.markets[symbol];
-    const minCost = Number(market?.limits?.cost?.min || 0);
+    const minCost = this.getMinCost(symbol);
     const targetNotional = Math.max(this.getOrderSizeUsdt(), minCost);
     const notional = Math.min(targetNotional, availableInvestmentUsdt);
     if (minCost > 0 && notional < minCost - 1e-8) return 0;
