@@ -2142,9 +2142,9 @@ class SpotGridEngine {
       if (order.side === 'buy') activeBuyLevels.add(idx);
       if (order.side === 'sell') activeSellLevels.add(idx);
     }
-    const recentlyPlacedCutoff = Date.now() - Math.max(INTERVAL_MS * 2, MINUTE_MS);
+    // Tambahkan semua order dari state lokal ke activeLevels agar tidak double-place,
+    // termasuk order lama yang masih aktif di exchange
     for (const order of Object.values(this.state.getSymbol(symbol).orders)) {
-      if (Date.parse(order.createdAt) < recentlyPlacedCutoff) continue;
       if (order.side === 'buy') activeBuyLevels.add(Number(order.levelIndex));
       if (order.side === 'sell') activeSellLevels.add(Number(order.levelIndex));
     }
@@ -2195,6 +2195,10 @@ class SpotGridEngine {
 
     for (const level of above) {
       if (!aiDecision.allowTrading || !aiDecision.allowSell) break;
+      if (this.countActiveOrders(this.state.getSymbol(symbol), 'sell') >= GRID_MAX_ACTIVE_SELL_ORDERS) {
+        console.warn(`[SKIP] ${symbol} SELL level=${level.index} | active sell order limit (${GRID_MAX_ACTIVE_SELL_ORDERS}) reached`);
+        break;
+      }
       if (activeSellLevels.has(level.index)) continue;
       let trackedAmount = this.amountForTrackedSell(symbol, level.index);
       if (!(trackedAmount > 0)) continue;
