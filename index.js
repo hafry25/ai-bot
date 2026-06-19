@@ -1787,6 +1787,21 @@ class SpotGridEngine {
     return 0;
   }
 
+  syncManagedOrdersWithExchange(symbol, symState, openOrderIds) {
+    let cleaned = 0;
+    for (const orderId of Object.keys(symState.orders)) {
+      if (!openOrderIds.has(orderId)) {
+        // Order tidak ada di exchange (sudah filled, cancelled, atau dihapus manual)
+        delete symState.orders[orderId];
+        cleaned++;
+      }
+    }
+    if (cleaned > 0) {
+      console.log(`[SYNC-STATE] ${symbol} removed ${cleaned} stale local order(s) not found on exchange`);
+      this.state.save();
+    }
+  }
+
   async handleBuyFill(symbol, levels, aiDecision, symState, trade, orderMeta, openOrderIds) {
     const price = Number(trade.price);
     const amount = Number(trade.amount);
@@ -1836,6 +1851,10 @@ class SpotGridEngine {
       );
       return;
     }
+
+    // Sync state lokal dengan exchange sebelum cek hasActiveOrderAtLevel
+    // agar order yang dihapus manual tidak menghalangi pemasangan ulang
+    this.syncManagedOrdersWithExchange(symbol, symState, openOrderIds);
 
     // Jika sell order sudah aktif di level ini, cek apakah amount-nya perlu diupdate
     if (this.hasActiveOrderAtLevel(symState, 'sell', sellLevelIndex)) {
@@ -2011,6 +2030,9 @@ class SpotGridEngine {
       retry(() => this.exchange.fetchOpenOrders(symbol)),
     ]);
     const openOrderIds = new Set(openOrders.map(order => String(order.id)));
+    // Bersihkan state lokal dari order yang sudah tidak ada di exchange
+    // (mis. dihapus manual, cancelled di luar bot, dll.)
+    this.syncManagedOrdersWithExchange(symbol, symState, openOrderIds);
     for (const trade of trades.sort((a, b) => a.timestamp - b.timestamp)) {
       const id = this.getTradeId(trade);
       if (this.state.processedTrade(symbol, id)) continue;
