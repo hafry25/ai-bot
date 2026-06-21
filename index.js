@@ -664,7 +664,7 @@ class LearningMemory {
   }
 
   isEnabled() {
-    return this.enabled !== false;
+    return this.enabled === true;
   }
 
   load() {
@@ -1138,7 +1138,7 @@ DECISION FRAMEWORK:
 1. VOLATILITY FILTER (rangePct = ${rangePct.toFixed(2)}%):
    - Block if rangePct > 8% (extreme volatility = unsafe grid)
    - Use caution if rangePct > 5% (elevated volatility)
-   
+
 2. VOLUME FILTER (volume ratio = ${volumeRatio.toFixed(2)}x):
    - Block if recent volume < 50% of average (liquidity warning)
 
@@ -1849,8 +1849,7 @@ class SpotGridEngine {
         amountNum: preciseAmountNum,
         notional,
       } = this.getPreciseOrderNumbers(symbol, price, amount);
-      const priceNum = Number(price);
-      const priceDiffPct = Math.abs(preciseNum - priceNum) / priceNum * 100;
+      const priceDiffPct = Math.abs(preciseNum - Number(price)) / Number(price) * 100;
       if (priceDiffPct > GRID_PRICE_PRECISION_MAX_DEVIATION_PCT) {
         console.warn(
           `[SKIP] ${symbol} ${side.toUpperCase()} level=${levelIndex} price=${price} -> ${precisePrice} | precision adjustment too large (${priceDiffPct.toFixed(4)}%)`
@@ -1975,7 +1974,7 @@ class SpotGridEngine {
     const sellableAmount = this.amountAfterBuyFee(symbol, trade);
     const costQuote = price * amount;
     const feeQuote = this.feeToQuote(feeCost, feeCurrency, price, base, quote);
-    
+
     symState.lastBuyByLevel[levelIndex] = this.mergeBuyRecords(
       symState.lastBuyByLevel[levelIndex],
       {
@@ -1987,7 +1986,6 @@ class SpotGridEngine {
         at: trade.datetime,
       }
     );
-    
     this.state.data.totals.filledBuys++;
     this.state.save();
     this.forgetOrderIfClosed(symState, trade, openOrderIds);
@@ -2066,14 +2064,13 @@ class SpotGridEngine {
       this.state.markProcessedTrade(symbol, this.getTradeId(trade));
       return;
     }
-    
+
     const base = this.getBaseAsset(symbol);
     const quote = this.getQuoteAsset(symbol);
     const feeCost = this.getTradeFeeCost(trade);
     const feeCurrency = this.getTradeFeeCurrency(trade);
     const proceedsQuote = price * amount;
     const feeQuote = this.feeToQuote(feeCost, feeCurrency, price, base, quote);
-    
     const totalBuyAmount = buy.amount;
     const sellableAtBuy = buy.sellableAmount ?? totalBuyAmount;
     if (!(sellableAtBuy > 0)) {
@@ -2086,12 +2083,10 @@ class SpotGridEngine {
     const allocatedBuyCost = buy.totalCostQuote * proportion;
     const allocatedBuyFee = buy.totalFeeQuote * proportion;
     const profit = (proceedsQuote - feeQuote) - (allocatedBuyCost + allocatedBuyFee);
-    
     symState.realizedGridProfit += profit;
     this.state.data.totals.realizedGridProfit += profit;
     this.state.data.totals.filledSells++;
     this.forgetOrderIfClosed(symState, trade, openOrderIds);
-    
     const remainingSellable = sellableAtBuy - amount;
     if (remainingSellable > 0) {
       const newProportion = remainingSellable / sellableAtBuy;
@@ -2107,11 +2102,10 @@ class SpotGridEngine {
     } else {
       delete symState.lastBuyByLevel[buyLevelIndex];
     }
-    
     this.state.save();
     this.state.markProcessedTrade(symbol, this.getTradeId(trade));
     await this.sendAlert(`[GRID SELL] ${symbol} amount=${amount} @ ${price} | profit=${profit.toFixed(4)} ${quote} | fee=${feeQuote.toFixed(4)} ${quote}`);
-    
+
     if (GRID_REFILL_ON_FILLED && aiDecision.allowTrading && aiDecision.allowBuy && levelIndex - 1 >= 0) {
       const buyPrice = levels[levelIndex - 1];
       if (this.hasActiveOrderAtLevel(symState, 'buy', levelIndex - 1)) {
@@ -2321,11 +2315,10 @@ class SpotGridEngine {
     let managedOrders = this.getManagedOpenOrders(symbol, freshOpenOrders);
 
     if (GRID_CANCEL_OUT_OF_RANGE) {
-      const recentThresholdMs = GRID_CANCEL_OUT_OF_RANGE_THRESHOLD_MS;
       for (const order of managedOrders) {
         const orderTimestamp = Number(order.timestamp) || Date.parse(order.datetime || 0) || 0;
         const orderAgeMs = Date.now() - orderTimestamp;
-        if (orderAgeMs < recentThresholdMs) continue;
+        if (orderAgeMs < GRID_CANCEL_OUT_OF_RANGE_THRESHOLD_MS) continue;
         const isValidGridOrder = this.isOrderCloseToPriceLevel(order.price, levels, this.exchange.markets[symbol]);
         if (isValidGridOrder) continue;
         if (!this.isOrderInsideRange(order, lower, upper)) {
@@ -2370,7 +2363,7 @@ class SpotGridEngine {
         console.warn(`[SKIP] ${symbol} BUY level=${level.index} | investment cap reached`);
         break;
       }
-      
+
       const minCost = this.getMinCost(symbol);
       if (minCost > 0 && cost < minCost - 1e-8) {
         const requiredAmount = minCost / level.price;
@@ -2411,14 +2404,14 @@ class SpotGridEngine {
         console.warn(`[SKIP] ${symbol} SELL level=${level.index} | insufficient free base, checking farther sell levels`);
         continue;
       }
-      
+
       const minCost = this.getMinCost(symbol);
       const notional = amount * level.price;
       if (minCost > 0 && notional < minCost - 1e-8) {
         console.warn(`[SKIP] ${symbol} SELL level=${level.index} | notional too low (dust), keeping buy record for later retry`);
         continue;
       }
-      
+
       const order = await this.placeLimit(symbol, 'sell', level.index, level.price, amount);
       if (!order) continue;
       baseFree -= amount;
@@ -2530,7 +2523,6 @@ class SpotGridEngine {
       }
       if (!hadError) this.recordSuccess();
     } catch (err) {
-      hadError = true;
       console.error('[CYCLE]', err);
       this.recordError();
     } finally {
