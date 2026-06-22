@@ -144,8 +144,14 @@ class AtomicFileWriter {
       .catch(() => {})
       .then(async () => {
         const tempPath = `${filePath}.${process.pid}.${sequence}.tmp`;
-        await fs.promises.writeFile(tempPath, buildContents());
-        await fs.promises.rename(tempPath, filePath);
+        try {
+          await fs.promises.writeFile(tempPath, buildContents());
+          await fs.promises.rename(tempPath, filePath);
+        } catch (err) {
+          // Best-effort cleanup of the orphaned temp file so it doesn't accumulate.
+          fs.promises.unlink(tempPath).catch(() => {});
+          throw err;
+        }
       })
       .catch(err => {
         console.warn(`[FILE] Failed to persist ${filePath}:`, err.message);
@@ -157,6 +163,35 @@ class AtomicFileWriter {
       });
     AtomicFileWriter.queues.set(filePath, current);
     return current;
+  }
+
+  /**
+   * Remove any leftover *.tmp files for the given base path that were
+   * abandoned by a previous (crashed) process.  Safe to call on startup
+   * before any writes begin.
+   */
+  static async cleanupStaleTempFiles(filePath) {
+    const dir = path.dirname(filePath);
+    const base = path.basename(filePath);
+    let entries;
+    try {
+      entries = await fs.promises.readdir(dir);
+    } catch {
+      return;
+    }
+    const stalePattern = new RegExp(`^${base.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\.(\\d+)\\.\\d+\\.tmp$`);
+    for (const entry of entries) {
+      if (!stalePattern.test(entry)) continue;
+      const tmpPath = path.join(dir, entry);
+      try {
+        await fs.promises.unlink(tmpPath);
+        console.warn(`[FILE] Removed stale temp file: ${tmpPath}`);
+      } catch (err) {
+        if (err.code !== 'ENOENT') {
+          console.warn(`[FILE] Could not remove stale temp file ${tmpPath}:`, err.message);
+        }
+      }
+    }
   }
 }
 
@@ -600,10 +635,10 @@ class GridState {
     await this.save();
   }
 
-  forgetOrder(symbol, orderId) {
+  async forgetOrder(symbol, orderId) {
     const sym = this.getSymbol(symbol);
     delete sym.orders[String(orderId)];
-    this.save();
+    await this.save();
   }
 
   processedTrade(symbol, id) {
@@ -680,7 +715,7 @@ class LearningMemory {
   }
 
   // Call this whenever a sell order is filled with its realised profit
-  recordProfit(symbol, profit) {
+  async recordProfit(symbol, profit) {
     if (!this.isEnabled()) return;
     if (!this.data[symbol]) {
       this.data[symbol] = { profits: [], totalProfit: 0, count: 0 };
@@ -693,7 +728,7 @@ class LearningMemory {
     }
     record.totalProfit += profit;
     record.count += 1;
-    this.save();
+    await this.save();
   }
 
   // Returns a confidence multiplier factor for the given symbol
@@ -1161,7 +1196,7 @@ class SpotGridEngine {
     return true;
   }
 
-  buildRange(symbol, currentPrice) {
+  async buildRange(symbol, currentPrice) {
     const symState = this.state.getSymbol(symbol);
     const manualRange = hasManualGridRange();
     let storedLower = Number(symState.config.lower) || 0;
@@ -1208,7 +1243,7 @@ class SpotGridEngine {
       if (!this.rangeResetSymbols) this.rangeResetSymbols = new Set();
       this.rangeResetSymbols.add(symbol);
     }
-    this.state.save();
+    await this.state.save();
     return { lower, upper };
   }
 
@@ -1404,7 +1439,7 @@ class SpotGridEngine {
     symState.lastBuyByLevel = cleanedBuys;
     trailingState.shifts += shift.steps;
     trailingState.lastShiftAt = new Date().toISOString();
-    this.state.save();
+    await this.state.save();
 
     console.log(
       `[TRAILING ${direction.toUpperCase()}] ${symbol} shifted ${shift.steps} grid(s): ` +
@@ -1488,7 +1523,7 @@ class SpotGridEngine {
       retry(() => this.exchange.fetchBalance()),
     ]);
     const currentPrice = Number(ticker.last);
-    const { lower, upper } = this.buildRange(symbol, currentPrice);
+    const { lower, upper } = await this.buildRange(symbol, currentPrice);
     const levels = this.buildLevels(lower, upper);
     return { ticker, currentPrice, openOrders, balance, lower, upper, levels };
   }
@@ -1533,7 +1568,7 @@ class SpotGridEngine {
     for (const order of managed) {
       try {
         await retry(() => this.exchange.cancelOrder(order.id, symbol));
-        this.state.forgetOrder(symbol, order.id);
+        await this.state.forgetOrder(symbol, order.id);
         result.cancelled.push(String(order.id));
         console.log(`[CANCEL] ${symbol} ${order.side} ${order.id} | ${reason}`);
       } catch (err) {
@@ -1547,7 +1582,7 @@ class SpotGridEngine {
   async cancelOrder(symbol, order, reason) {
     if (!this.exchange?.cancelOrder) return;
     await retry(() => this.exchange.cancelOrder(order.id, symbol));
-    this.state.forgetOrder(symbol, order.id);
+    await this.state.forgetOrder(symbol, order.id);
     console.log(`[CANCEL] ${symbol} ${order.side} ${order.id} | ${reason}`);
   }
 
@@ -1693,22 +1728,45 @@ class SpotGridEngine {
     if (!feeCurrency || feeCost === 0) return 0;
     if (feeCurrency === quoteAsset) return feeCost;
     if (feeCurrency === baseAsset) return feeCost * price;
-    // Third-party fee token (e.g. BNB).  We cannot convert without a live
-    // price feed, so we conservatively treat the fee as zero-quote-cost and
-    // log a warning.  This slightly overstates profit, but is safe – the
-    // alternative of crashing or refusing to record the fill is worse.
-    // To improve accuracy, set GRID_FEE_CURRENCY_OVERRIDE=USDT in .env so
-    // Binance deducts fees in the quote asset instead of BNB.
+    // Third-party fee token (e.g. BNB).  We cannot convert synchronously
+    // without a live price – use the cached rate if available, otherwise 0.
+    // Call cacheFeeTokenPrice() asynchronously to keep rates fresh.
+    const cachedRate = this.feeTokenRates?.get(feeCurrency);
+    if (cachedRate > 0) {
+      return feeCost * cachedRate;
+    }
     console.warn(
       `[FEE] Fee currency "${feeCurrency}" is neither base (${baseAsset}) nor quote ` +
-      `(${quoteAsset}). Fee cost ${feeCost} ${feeCurrency} cannot be converted – ` +
-      `recording as 0 ${quoteAsset}. Consider setting SAPI fee currency to ${quoteAsset} ` +
-      `on Binance, or enable BNB fee deduction so fees appear in a known currency.`
+      `(${quoteAsset}). No cached rate available – recording fee as 0 ${quoteAsset}. ` +
+      `Rate will be fetched in the background. Consider switching Binance fee payment ` +
+      `to ${quoteAsset} for accurate P&L.`
     );
     return 0;
   }
 
-  syncManagedOrdersWithExchange(symbol, symState, openOrderIds) {
+  /**
+   * Fetch and cache the USDT (quote) price for a third-party fee token such
+   * as BNB.  Called once per cycle before fill processing so that
+   * feeToQuote() has a fresh rate to work with.
+   */
+  async cacheFeeTokenPrice(feeCurrency, quoteAsset) {
+    if (!feeCurrency || feeCurrency === quoteAsset) return;
+    if (!this.feeTokenRates) this.feeTokenRates = new Map();
+    const pair = `${feeCurrency}/${quoteAsset}`;
+    try {
+      if (this.exchange.markets[pair]) {
+        const ticker = await retry(() => this.exchange.fetchTicker(pair));
+        const rate = Number(ticker?.last);
+        if (rate > 0) {
+          this.feeTokenRates.set(feeCurrency, rate);
+        }
+      }
+    } catch (err) {
+      console.warn(`[FEE] Could not fetch price for ${pair}: ${err.message}`);
+    }
+  }
+
+  async syncManagedOrdersWithExchange(symbol, symState, openOrderIds) {
     let cleaned = 0;
     for (const orderId of Object.keys(symState.orders)) {
       if (!openOrderIds.has(orderId)) {
@@ -1718,7 +1776,7 @@ class SpotGridEngine {
     }
     if (cleaned > 0) {
       console.log(`[SYNC-STATE] ${symbol} removed ${cleaned} stale local order(s) not found on exchange`);
-      this.state.save();
+      await this.state.save();
     }
   }
 
@@ -1746,8 +1804,8 @@ class SpotGridEngine {
       }
     );
     this.state.data.totals.filledBuys++;
-    this.state.save();
-    this.forgetOrderIfClosed(symState, trade, openOrderIds);
+    await this.state.save();
+    await this.forgetOrderIfClosed(symState, trade, openOrderIds);
     await this.state.markProcessedTrade(symbol, this.getTradeId(trade));
     await this.sendAlert(`[GRID BUY] ${symbol} amount=${amount} @ ${price} | sellable=${sellableAmount} | fee=${feeQuote.toFixed(4)} ${quote}`);
     if (!GRID_REFILL_ON_FILLED || !aiDecision.allowTrading || !aiDecision.allowSell || levelIndex + 1 >= levels.length) return;
@@ -1769,7 +1827,7 @@ class SpotGridEngine {
       return;
     }
 
-    this.syncManagedOrdersWithExchange(symbol, symState, openOrderIds);
+    await this.syncManagedOrdersWithExchange(symbol, symState, openOrderIds);
 
     if (this.hasActiveOrderAtLevel(symState, 'sell', sellLevelIndex)) {
       const existingOrder = Object.values(symState.orders).find(o =>
@@ -1812,7 +1870,7 @@ class SpotGridEngine {
     const buy = symState.lastBuyByLevel[buyLevelIndex];
     if (!buy) {
       console.warn(`[SELL] ${symbol} level ${levelIndex} has no corresponding buy record. Skipping profit calculation.`);
-      this.forgetOrderIfClosed(symState, trade, openOrderIds);
+      await this.forgetOrderIfClosed(symState, trade, openOrderIds);
       this.state.markProcessedTrade(symbol, this.getTradeId(trade));
       return;
     }
@@ -1827,7 +1885,7 @@ class SpotGridEngine {
     const sellableAtBuy = buy.sellableAmount ?? totalBuyAmount;
     if (!(sellableAtBuy > 0)) {
       console.warn(`[SELL] ${symbol} level ${levelIndex} buy record has zero sellable amount. Skipping profit calculation.`);
-      this.forgetOrderIfClosed(symState, trade, openOrderIds);
+      await this.forgetOrderIfClosed(symState, trade, openOrderIds);
       this.state.markProcessedTrade(symbol, this.getTradeId(trade));
       return;
     }
@@ -1838,14 +1896,14 @@ class SpotGridEngine {
 
     // ---- Record profit for learning memory ----
     if (this.aiValidator.learningMemory) {
-      this.aiValidator.learningMemory.recordProfit(symbol, profit);
+      await this.aiValidator.learningMemory.recordProfit(symbol, profit);
     }
     // -------------------------------------------
 
     symState.realizedGridProfit += profit;
     this.state.data.totals.realizedGridProfit += profit;
     this.state.data.totals.filledSells++;
-    this.forgetOrderIfClosed(symState, trade, openOrderIds);
+    await this.forgetOrderIfClosed(symState, trade, openOrderIds);
     const remainingSellable = sellableAtBuy - amount;
     if (remainingSellable > 0) {
       const newProportion = remainingSellable / sellableAtBuy;
@@ -1859,7 +1917,7 @@ class SpotGridEngine {
     } else {
       delete symState.lastBuyByLevel[buyLevelIndex];
     }
-    this.state.save();
+    await this.state.save();
     await this.state.markProcessedTrade(symbol, this.getTradeId(trade));
     await this.sendAlert(`[GRID SELL] ${symbol} amount=${amount} @ ${price} | profit=${profit.toFixed(4)} ${quote} | fee=${feeQuote.toFixed(4)} ${quote}`);
 
@@ -1904,10 +1962,10 @@ class SpotGridEngine {
     return String(trade.id || `${trade.order}-${trade.timestamp}`);
   }
 
-  forgetOrderIfClosed(symState, trade, openOrderIds) {
+  async forgetOrderIfClosed(symState, trade, openOrderIds) {
     if (!openOrderIds.has(String(trade.order))) {
       delete symState.orders[String(trade.order)];
-      this.state.save();
+      await this.state.save();
     }
   }
 
@@ -1941,13 +1999,29 @@ class SpotGridEngine {
     if (allTrades.length) {
       const maxTs = Math.max(...allTrades.map(t => t.timestamp));
       symState.lastTradeTimestamp = maxTs;
-      this.state.save();
+      await this.state.save();
     }
     return allTrades;
   }
 
   async handleFilledTrades(symbol, levels, aiDecision) {
     const symState = this.state.getSymbol(symbol);
+    const quoteAsset = this.getQuoteAsset(symbol);
+
+    // Pre-warm the fee-token rate cache so feeToQuote() can convert third-party
+    // fees (e.g. BNB) for any fills encountered in this cycle.
+    // BNB is the only Binance platform token used for fee discounts, but we
+    // also refresh any previously seen unknown token for this symbol.
+    const knownFeeTokens = new Set(['BNB']);
+    if (this.feeTokenRates) {
+      for (const token of this.feeTokenRates.keys()) knownFeeTokens.add(token);
+    }
+    await Promise.all(
+      [...knownFeeTokens]
+        .filter(t => t !== quoteAsset && t !== this.getBaseAsset(symbol))
+        .map(t => this.cacheFeeTokenPrice(t, quoteAsset))
+    );
+
     const [trades, openOrders] = await Promise.all([
       this.fetchNewTrades(symbol, symState),
       retry(() => this.exchange.fetchOpenOrders(symbol)),
@@ -1996,11 +2070,11 @@ class SpotGridEngine {
       } else if (side === 'sell') {
         await this.handleSellFill(symbol, levels, aiDecision, symState, trade, orderMeta_final, openOrderIds);
       } else {
-        this.forgetOrderIfClosed(symState, trade, openOrderIds);
+        await this.forgetOrderIfClosed(symState, trade, openOrderIds);
         this.state.markProcessedTrade(symbol, id);
       }
     }
-    this.syncManagedOrdersWithExchange(symbol, symState, openOrderIds);
+    await this.syncManagedOrdersWithExchange(symbol, symState, openOrderIds);
   }
 
   async enforceRangeExits(symbol, currentPrice) {
@@ -2365,6 +2439,12 @@ Learning Memory: ${LEARNING_MEMORY_ENABLED ? 'ON' : 'OFF'}
 
 async function bootstrap() {
   validateRuntimeConfiguration();
+
+  // Remove any *.tmp files left behind by a previous crashed process before
+  // acquiring the lock so they don't interfere with new atomic writes.
+  await AtomicFileWriter.cleanupStaleTempFiles(GRID_STATE_PATH);
+  await AtomicFileWriter.cleanupStaleTempFiles(LEARNING_MEMORY_PATH);
+
   const lock = new ProcessLock(BOT_LOCK_PATH);
   lock.acquire();
   const shutdown = signal => {
