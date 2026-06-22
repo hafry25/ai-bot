@@ -559,7 +559,7 @@ class GridState {
 
   save() {
     this.data.updatedAt = new Date().toISOString();
-    AtomicFileWriter.write(GRID_STATE_PATH, () => JSON.stringify(this.data, null, 2));
+    return AtomicFileWriter.write(GRID_STATE_PATH, () => JSON.stringify(this.data, null, 2));
   }
 
   getSymbol(symbol) {
@@ -587,7 +587,7 @@ class GridState {
     return sym;
   }
 
-  rememberOrder(symbol, order, meta) {
+  async rememberOrder(symbol, order, meta) {
     const sym = this.getSymbol(symbol);
     sym.orders[String(order.id)] = {
       id: String(order.id),
@@ -597,7 +597,7 @@ class GridState {
       amount: Number(order.amount),
       createdAt: new Date().toISOString(),
     };
-    this.save();
+    await this.save();
   }
 
   forgetOrder(symbol, orderId) {
@@ -613,7 +613,7 @@ class GridState {
       this.processedTradeIdSet.has(legacyId);
   }
 
-  markProcessedTrade(symbol, id) {
+  async markProcessedTrade(symbol, id) {
     const scopedId = scopedTradeId(symbol, id);
     if (this.processedTrade(symbol, id)) return false;
     this.data.processedTradeIds.push(scopedId);
@@ -622,7 +622,7 @@ class GridState {
     if (this.data.processedTradeIds.length >= MAX_PROCESSED_TRADE_IDS) {
       this.rebuildProcessedTradeIndex();
     }
-    this.save();
+    await this.save();
     return true;
   }
 }
@@ -1358,8 +1358,16 @@ class SpotGridEngine {
   async applyTrailingRangeShift(symbol, lower, upper, shift, direction) {
     const cancelResult = await this.cancelGridOrders(symbol, `trailing-${direction}`);
     if (cancelResult.failed.length > 0) {
-      const failedIds = cancelResult.failed.map(failure => failure.id).join(', ');
-      throw new Error(`Trailing ${direction} shift aborted; failed to cancel grid orders: ${failedIds}`);
+      const failedIds = cancelResult.failed.map(f => f.id).join(', ');
+      // Do NOT abort the shift: some orders may still be live on the exchange.
+      // Log clearly and continue – the next reconcile cycle will detect those
+      // orders via getManagedOpenOrders (they'll be in state.orders or carry a
+      // parseable clientOrderId) and either cancel them (GRID_CANCEL_OUT_OF_RANGE)
+      // or adopt them at the new grid level.
+      console.warn(
+        `[TRAILING] ${symbol} trailing-${direction} shift: ${cancelResult.failed.length} cancellation(s) failed ` +
+        `(ids: ${failedIds}). Proceeding with shift; stale orders will be cleaned up in the next cycle.`
+      );
     }
 
     const symState = this.state.getSymbol(symbol);
@@ -1485,7 +1493,7 @@ class SpotGridEngine {
     return { ticker, currentPrice, openOrders, balance, lower, upper, levels };
   }
 
-  getManagedOpenOrders(symbol, openOrders) {
+  async getManagedOpenOrders(symbol, openOrders) {
     const symState = this.state.getSymbol(symbol);
     const managedIds = new Set(Object.keys(symState.orders));
     const managed = [];
@@ -1493,7 +1501,7 @@ class SpotGridEngine {
       const orderId = String(order.id);
       const levelIndex = this.getBotOrderLevel(order);
       if (!managedIds.has(orderId) && levelIndex !== null) {
-        this.state.rememberOrder(symbol, order, { levelIndex });
+        await this.state.rememberOrder(symbol, order, { levelIndex });
         managedIds.add(orderId);
         console.warn(`[RECOVER] ${symbol} adopted order ${orderId} level=${levelIndex}`);
       }
@@ -1521,7 +1529,7 @@ class SpotGridEngine {
     const result = { cancelled: [], failed: [] };
     if (!this.exchange?.fetchOpenOrders || !this.exchange?.cancelOrder) return result;
     const openOrders = await retry(() => this.exchange.fetchOpenOrders(symbol));
-    const managed = this.getManagedOpenOrders(symbol, openOrders);
+    const managed = await this.getManagedOpenOrders(symbol, openOrders);
     for (const order of managed) {
       try {
         await retry(() => this.exchange.cancelOrder(order.id, symbol));
@@ -1611,7 +1619,7 @@ class SpotGridEngine {
       }
 
       const order = await this.createOrderWithFallback(symbol, side, preciseAmount, precisePrice, levelIndex);
-      this.state.rememberOrder(symbol, order, { levelIndex });
+      await this.state.rememberOrder(symbol, order, { levelIndex });
       console.log(`[GRID] ${symbol} ${side.toUpperCase()} level=${levelIndex} amount=${preciseAmount} price=${precisePrice}${GRID_POST_ONLY ? ' (postOnly)' : ''}`);
       return order;
     } catch (err) {
@@ -1682,9 +1690,21 @@ class SpotGridEngine {
   }
 
   feeToQuote(feeCost, feeCurrency, price, baseAsset, quoteAsset) {
+    if (!feeCurrency || feeCost === 0) return 0;
     if (feeCurrency === quoteAsset) return feeCost;
     if (feeCurrency === baseAsset) return feeCost * price;
-    console.warn(`[FEE] Unknown fee currency ${feeCurrency}, cannot convert to ${quoteAsset}. Fee amount = ${feeCost}`);
+    // Third-party fee token (e.g. BNB).  We cannot convert without a live
+    // price feed, so we conservatively treat the fee as zero-quote-cost and
+    // log a warning.  This slightly overstates profit, but is safe – the
+    // alternative of crashing or refusing to record the fill is worse.
+    // To improve accuracy, set GRID_FEE_CURRENCY_OVERRIDE=USDT in .env so
+    // Binance deducts fees in the quote asset instead of BNB.
+    console.warn(
+      `[FEE] Fee currency "${feeCurrency}" is neither base (${baseAsset}) nor quote ` +
+      `(${quoteAsset}). Fee cost ${feeCost} ${feeCurrency} cannot be converted – ` +
+      `recording as 0 ${quoteAsset}. Consider setting SAPI fee currency to ${quoteAsset} ` +
+      `on Binance, or enable BNB fee deduction so fees appear in a known currency.`
+    );
     return 0;
   }
 
@@ -1728,7 +1748,7 @@ class SpotGridEngine {
     this.state.data.totals.filledBuys++;
     this.state.save();
     this.forgetOrderIfClosed(symState, trade, openOrderIds);
-    this.state.markProcessedTrade(symbol, this.getTradeId(trade));
+    await this.state.markProcessedTrade(symbol, this.getTradeId(trade));
     await this.sendAlert(`[GRID BUY] ${symbol} amount=${amount} @ ${price} | sellable=${sellableAmount} | fee=${feeQuote.toFixed(4)} ${quote}`);
     if (!GRID_REFILL_ON_FILLED || !aiDecision.allowTrading || !aiDecision.allowSell || levelIndex + 1 >= levels.length) return;
     const sellLevelIndex = levelIndex + 1;
@@ -1840,7 +1860,7 @@ class SpotGridEngine {
       delete symState.lastBuyByLevel[buyLevelIndex];
     }
     this.state.save();
-    this.state.markProcessedTrade(symbol, this.getTradeId(trade));
+    await this.state.markProcessedTrade(symbol, this.getTradeId(trade));
     await this.sendAlert(`[GRID SELL] ${symbol} amount=${amount} @ ${price} | profit=${profit.toFixed(4)} ${quote} | fee=${feeQuote.toFixed(4)} ${quote}`);
 
     if (GRID_REFILL_ON_FILLED && aiDecision.allowTrading && aiDecision.allowBuy && levelIndex - 1 >= 0) {
@@ -1936,16 +1956,45 @@ class SpotGridEngine {
     for (const trade of trades.sort((a, b) => a.timestamp - b.timestamp)) {
       const id = this.getTradeId(trade);
       if (this.state.processedTrade(symbol, id)) continue;
-      if (!symState.orders[String(trade.order)]) {
-        this.state.markProcessedTrade(symbol, id);
-        continue;
+
+      // Attempt to get order metadata from state, falling back to clientOrderId
+      // embedded in the trade so fills are never lost across restarts.
+      let orderMeta = symState.orders[String(trade.order)];
+      if (!orderMeta) {
+        // clientOrderId format: grid-<market>-<s|b>-<levelIndex>-<nonce>
+        const clientId = String(
+          trade.info?.clientOrderId ||
+          trade.info?.origClientOrderId ||
+          trade.clientOrderId ||
+          ''
+        );
+        const match = clientId.match(/^grid-[a-z0-9]+-([bs])-(\d+)-/);
+        if (match) {
+          const side = match[1] === 'b' ? 'buy' : 'sell';
+          const levelIndex = Number(match[2]);
+          orderMeta = { levelIndex, side };
+          console.warn(
+            `[RECOVER] ${symbol} reconstructed orderMeta for trade ${id} ` +
+            `from clientOrderId="${clientId}" (level=${levelIndex}, side=${side})`
+          );
+        } else {
+          // Cannot determine which grid level this fill belongs to; skip it
+          // but mark as processed so we don't retry on every cycle.
+          console.warn(
+            `[SKIP] ${symbol} trade ${id}: order ${trade.order} not in state and ` +
+            `no parseable clientOrderId – fill cannot be attributed to a grid level`
+          );
+          this.state.markProcessedTrade(symbol, id);
+          continue;
+        }
       }
-      const orderMeta = symState.orders[String(trade.order)];
+
+      const orderMeta_final = orderMeta;
       const side = String(trade.side).toLowerCase();
       if (side === 'buy') {
-        await this.handleBuyFill(symbol, levels, aiDecision, symState, trade, orderMeta, openOrderIds);
+        await this.handleBuyFill(symbol, levels, aiDecision, symState, trade, orderMeta_final, openOrderIds);
       } else if (side === 'sell') {
-        await this.handleSellFill(symbol, levels, aiDecision, symState, trade, orderMeta, openOrderIds);
+        await this.handleSellFill(symbol, levels, aiDecision, symState, trade, orderMeta_final, openOrderIds);
       } else {
         this.forgetOrderIfClosed(symState, trade, openOrderIds);
         this.state.markProcessedTrade(symbol, id);
@@ -2045,7 +2094,7 @@ class SpotGridEngine {
     // Re-read balances after any refill orders so placement loops use fresh funds.
     balance = await retry(() => this.exchange.fetchBalance());
     let freshOpenOrders = await retry(() => this.exchange.fetchOpenOrders(symbol));
-    let managedOrders = this.getManagedOpenOrders(symbol, freshOpenOrders);
+    let managedOrders = await this.getManagedOpenOrders(symbol, freshOpenOrders);
 
     if (GRID_CANCEL_OUT_OF_RANGE) {
       for (const order of managedOrders) {
@@ -2059,7 +2108,7 @@ class SpotGridEngine {
         }
       }
       freshOpenOrders = await retry(() => this.exchange.fetchOpenOrders(symbol));
-      managedOrders = this.getManagedOpenOrders(symbol, freshOpenOrders);
+      managedOrders = await this.getManagedOpenOrders(symbol, freshOpenOrders);
     }
 
     const activeBuyLevels = new Set();
