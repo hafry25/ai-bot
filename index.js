@@ -126,19 +126,7 @@ const LEARNING_MEMORY_FILE = Config.get('LEARNING_MEMORY_FILE', 'learning-memory
 const LEARNING_MEMORY_PATH = path.resolve(process.cwd(), LEARNING_MEMORY_FILE);
 const LEARNING_MEMORY_LOOKBACK = Config.number('LEARNING_MEMORY_LOOKBACK', 20);
 const LEARNING_MEMORY_MIN_SAMPLES = Config.number('LEARNING_MEMORY_MIN_SAMPLES', 5);
-const LEARNING_MEMORY_OUTCOME_DELAY_MS = Config.number('LEARNING_MEMORY_OUTCOME_DELAY_MS', 10 * MINUTE_MS);
-const LEARNING_MEMORY_RECENCY_HALF_LIFE_MS = Math.max(
-  Config.number('LEARNING_MEMORY_RECENCY_HALF_LIFE_HOURS', 24),
-  1
-) * 60 * 60 * 1000;
-const LEARNING_MEMORY_MAX_RECORDS = Config.number('LEARNING_MEMORY_MAX_RECORDS', 2000);
-const LEARNING_MEMORY_PROFIT_THRESHOLD_PCT = Config.number('LEARNING_MEMORY_PROFIT_THRESHOLD_PCT', 0.5);
-const LEARNING_MEMORY_EXPLORE_AFTER_BLOCKS = Config.number('LEARNING_MEMORY_EXPLORE_AFTER_BLOCKS', 20);
-const LEARNING_MEMORY_EXPLORE_COOLDOWN_MS = Math.max(
-  Config.number('LEARNING_MEMORY_EXPLORE_COOLDOWN_MINUTES', 60),
-  0
-) * MINUTE_MS;
-// ---------------------------------------
+// ---------------------------------------------------
 
 const MAX_PROCESSED_TRADE_IDS = 2000;
 const TRADE_FETCH_LIMIT = 100;
@@ -179,11 +167,6 @@ const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 
 function sleepSync(ms) {
   if (!(ms > 0)) return;
-  // Used only during startup lock acquisition (stale-lock grace period), before the bot
-  // begins its async event loop. The busy-loop fallback is intentional: it runs for at
-  // most BOT_LOCK_STALE_GRACE_MS (default 2 s) and only when SharedArrayBuffer is
-  // unavailable (e.g. missing COOP/COEP headers in some environments). The blast radius
-  // is one short CPU-bound wait at startup — not inside the trading loop.
   try {
     const buffer = new SharedArrayBuffer(4);
     Atomics.wait(new Int32Array(buffer), 0, 0, ms);
@@ -287,11 +270,6 @@ function validateRuntimeConfiguration() {
   if (LEARNING_MEMORY_ENABLED) {
     requireInteger('LEARNING_MEMORY_MIN_SAMPLES', LEARNING_MEMORY_MIN_SAMPLES, 1);
     requireInteger('LEARNING_MEMORY_LOOKBACK', LEARNING_MEMORY_LOOKBACK, 1);
-    requireInteger('LEARNING_MEMORY_MAX_RECORDS', LEARNING_MEMORY_MAX_RECORDS, 1);
-    requirePositive('LEARNING_MEMORY_RECENCY_HALF_LIFE_HOURS',
-      Config.number('LEARNING_MEMORY_RECENCY_HALF_LIFE_HOURS', 24));
-    requireNonNegative('LEARNING_MEMORY_OUTCOME_DELAY_MS', LEARNING_MEMORY_OUTCOME_DELAY_MS);
-    requireNonNegative('LEARNING_MEMORY_PROFIT_THRESHOLD_PCT', LEARNING_MEMORY_PROFIT_THRESHOLD_PCT);
     if (LEARNING_MEMORY_MIN_SAMPLES > LEARNING_MEMORY_LOOKBACK) {
       errors.push(
         `LEARNING_MEMORY_MIN_SAMPLES (${LEARNING_MEMORY_MIN_SAMPLES}) must be <= ` +
@@ -430,7 +408,6 @@ class ProcessLock {
     }
   }
 
-  // Returns true if the lock does not exist, false if a valid lock exists.
   assertLockCanBeAcquired() {
     try {
       const owner = this.readOwner();
@@ -651,263 +628,117 @@ class GridState {
 }
 
 // ------------------------------
-//  Learning Memory
+//  Learning Memory 
 // ------------------------------
 class LearningMemory {
   constructor() {
-    this.records = [];
     this.filePath = LEARNING_MEMORY_PATH;
     this.enabled = LEARNING_MEMORY_ENABLED;
-    if (LEARNING_MEMORY_ENABLED) {
-      this.load();
-    }
+    this.windowSize = LEARNING_MEMORY_LOOKBACK;
+    this.minSamples = LEARNING_MEMORY_MIN_SAMPLES;
+    this.data = {}; // symbol -> { profits: [], totalProfit: 0, count: 0 }
+    if (this.enabled) this.load();
   }
 
-  isEnabled() {
-    return this.enabled === true;
-  }
+  isEnabled() { return this.enabled === true; }
 
   load() {
     try {
       if (fs.existsSync(this.filePath)) {
         const raw = fs.readFileSync(this.filePath, 'utf8');
         const parsed = JSON.parse(raw);
-        this.records = Array.isArray(parsed)
-          ? parsed.map(record => this.normalizeRecord(record)).filter(Boolean)
-          : [];
-        console.log(`[MEMORY] Loaded ${this.records.length} decision records.`);
+        if (isPlainObject(parsed)) {
+          for (const [symbol, record] of Object.entries(parsed)) {
+            if (Array.isArray(record.profits)) {
+              this.data[symbol] = {
+                profits: record.profits.map(Number).filter(v => Number.isFinite(v)),
+                totalProfit: Number(record.totalProfit) || 0,
+                count: Number(record.count) || 0,
+              };
+            }
+          }
+          console.log(`[MEMORY] Loaded memory for ${Object.keys(this.data).length} symbols.`);
+        }
       }
     } catch (err) {
       console.warn('[MEMORY] Failed to load memory file, starting fresh:', err.message);
-      this.records = [];
+      this.data = {};
     }
   }
 
   save() {
     if (!this.isEnabled()) return;
-    AtomicFileWriter.write(this.filePath, () => `${JSON.stringify(this.records, null, 2)}\n`);
-  }
-
-  normalizeRecord(record) {
-    if (!isPlainObject(record)) return null;
-    const context = isPlainObject(record.context) ? this.extractFeatures(record.context) : null;
-    if (!context) return null;
-    return {
-      id: typeof record.id === 'string' ? record.id : crypto.randomUUID(),
-      symbol: typeof record.symbol === 'string' ? record.symbol : 'unknown',
-      timestamp: Number(record.timestamp) || Date.now(),
-      context,
-      decision: isPlainObject(record.decision)
-        ? {
-            allowTrading: record.decision.allowTrading === true,
-            allowBuy: record.decision.allowBuy === true,
-            allowSell: record.decision.allowSell === true,
-            confidence: Number(record.decision.confidence) || 0,
-            reason: String(record.decision.reason || ''),
-          }
-        : {
-            allowTrading: false,
-            allowBuy: false,
-            allowSell: false,
-            confidence: 0,
-            reason: '',
-          },
-      profitAtDecision: Number.isFinite(Number(record.profitAtDecision)) ? Number(record.profitAtDecision) : null,
-      outcome: record.outcome === 'success' || record.outcome === 'failure' ? record.outcome : null,
-      outcomeAt: Number(record.outcomeAt) || null,
-      outcomeDelta: Number.isFinite(Number(record.outcomeDelta)) ? Number(record.outcomeDelta) : null,
-    };
-  }
-
-  recordDecision(symbol, context, decision, profit = null, features = null) {
-    if (!this.isEnabled()) return;
-    const record = {
-      id: crypto.randomUUID(),
-      symbol,
-      timestamp: Date.now(),
-      context: this.recordFeatures(context, features),
-      decision: {
-        allowTrading: decision.allowTrading,
-        allowBuy: decision.allowBuy,
-        allowSell: decision.allowSell,
-        confidence: decision.confidence,
-        reason: decision.reason,
-      },
-      profitAtDecision: profit,
-      outcome: null,
-    };
-    this.records.push(record);
-    if (this.records.length > LEARNING_MEMORY_MAX_RECORDS) {
-      this.records = this.records.slice(-LEARNING_MEMORY_MAX_RECORDS);
+    const toWrite = {};
+    for (const [symbol, record] of Object.entries(this.data)) {
+      toWrite[symbol] = {
+        profits: record.profits.slice(-this.windowSize),
+        totalProfit: record.totalProfit,
+        count: record.count,
+      };
     }
+    AtomicFileWriter.write(this.filePath, () => `${JSON.stringify(toWrite, null, 2)}\n`);
+  }
+
+  // Call this whenever a sell order is filled with its realised profit
+  recordProfit(symbol, profit) {
+    if (!this.isEnabled()) return;
+    if (!this.data[symbol]) {
+      this.data[symbol] = { profits: [], totalProfit: 0, count: 0 };
+    }
+    const record = this.data[symbol];
+    record.profits.push(profit);
+    if (record.profits.length > this.windowSize * 2) {
+      // Keep only the last 2*windowSize to avoid unbounded growth
+      record.profits = record.profits.slice(-this.windowSize * 2);
+    }
+    record.totalProfit += profit;
+    record.count += 1;
     this.save();
   }
 
-  recordFeatures(context, features = null) {
-    const extracted = this.extractFeatures(context);
-    if (!isPlainObject(features)) return extracted;
-    for (const key of Object.keys(extracted)) {
-      if (Number.isFinite(Number(features[key]))) {
-        extracted[key] = Number(features[key]);
-      }
+  // Returns a confidence multiplier factor for the given symbol
+  getAdjustment(symbol) {
+    if (!this.isEnabled()) return 1.0;
+    const record = this.data[symbol];
+    if (!record || record.profits.length < this.minSamples) return 1.0;
+
+    const recent = record.profits.slice(-this.windowSize);
+    const n = recent.length;
+    if (n < this.minSamples) return 1.0;
+
+    // Win rate
+    const wins = recent.filter(p => p > 0).length;
+    const winRate = wins / n;
+
+    // Average profit (relative to order size)
+    const avgProfit = recent.reduce((a, b) => a + b, 0) / n;
+    const orderSize = this.getOrderSizeUsdt();
+    const relProfit = orderSize > 0 ? avgProfit / orderSize : 0;
+
+    // Build factor
+    let factor = 1.0;
+    if (winRate > 0.6) {
+      factor += 0.2 * (winRate - 0.6) / 0.4; // max +0.2 when winRate=1.0
+    } else if (winRate < 0.4) {
+      factor -= 0.2 * (0.4 - winRate) / 0.4; // max -0.2 when winRate=0.0
     }
-    return extracted;
-  }
-
-  extractFeatures(context) {
-    const {
-      currentPrice, lower, upper,
-      trailingUpJustShifted, trailingDownJustShifted
-    } = context;
-    const price = Number(currentPrice) || 0;
-    const lowerPrice = Number(lower) || 0;
-    const upperPrice = Number(upper) || 0;
-    const span = Math.max(upperPrice - lowerPrice, 0);
-    const mid = (lowerPrice + upperPrice) / 2;
-    const rangePct = mid > 0 ? (span / mid) * 100 : 0;
-    const distLower = price > 0 ? ((price - lowerPrice) / price) * 100 : 0;
-    const distUpper = price > 0 ? ((upperPrice - price) / price) * 100 : 0;
-    const positionPct = span > 0 ? ((price - lowerPrice) / span) * 100 : 50;
-    return {
-      currentPrice: price,
-      rangePct: rangePct || 0,
-      distLower: distLower || 0,
-      distUpper: distUpper || 0,
-      positionPct: positionPct || 0,
-      trailingUp: trailingUpJustShifted ? 1 : 0,
-      trailingDown: trailingDownJustShifted ? 1 : 0,
-      changePct: 0,
-      volumeRatio: 0,
-    };
-  }
-
-  enrichContextFeatures(features, candleSummary) {
-    features.changePct = candleSummary.changePct || 0;
-    features.volumeRatio = candleSummary.volumeRatio || 0;
-    return features;
-  }
-
-  similarity(f1, f2) {
-    return this.similarityWithScales(f1, f2, this.defaultSimilarityScales());
-  }
-
-  defaultSimilarityScales() {
-    return [
-      { key: 'rangePct', min: 0, max: 20 },
-      { key: 'distLower', min: -20, max: 20 },
-      { key: 'distUpper', min: -20, max: 20 },
-      { key: 'positionPct', min: 0, max: 100 },
-      { key: 'changePct', min: -20, max: 20 },
-      { key: 'volumeRatio', min: 0, max: 10 },
-      { key: 'trailingUp', min: 0, max: 1 },
-      { key: 'trailingDown', min: 0, max: 1 },
-    ];
-  }
-
-  buildSimilarityScales(features, candidates) {
-    return this.defaultSimilarityScales().map(scale => {
-      const values = [features?.[scale.key], ...candidates.map(r => r.context?.[scale.key])]
-        .map(Number)
-        .filter(Number.isFinite);
-      if (values.length < 2) return scale;
-      const min = Math.min(...values);
-      const max = Math.max(...values);
-      if (max - min <= Number.EPSILON) return scale;
-      return { ...scale, min, max };
-    });
-  }
-
-  similarityWithScales(f1, f2, scales) {
-    let sumSq = 0;
-    for (const f of scales) {
-      const denom = f.max - f.min;
-      const a = Number(f1?.[f.key]) || 0;
-      const b = Number(f2?.[f.key]) || 0;
-      const na = denom > 0 ? (a - f.min) / denom : 0;
-      const nb = denom > 0 ? (b - f.min) / denom : 0;
-      sumSq += (na - nb) ** 2;
+    // Small bonus/penalty for average profit magnitude
+    if (relProfit > 0.01) {
+      factor += 0.1 * Math.min(relProfit / 0.1, 0.5); // max +0.1
+    } else if (relProfit < -0.01) {
+      factor -= 0.1 * Math.min(-relProfit / 0.1, 0.5); // max -0.1
     }
-    return Math.sqrt(sumSq / scales.length);
+
+    // Clamp between 0.5 and 1.5
+    factor = Math.min(1.5, Math.max(0.5, factor));
+    return factor;
   }
 
-  similarityWeight(distance) {
-    return 1 / (1 + Math.max(distance, 0));
-  }
-
-  recencyWeight(timestamp) {
-    const ageMs = Math.max(Date.now() - Number(timestamp || 0), 0);
-    return Math.pow(0.5, ageMs / LEARNING_MEMORY_RECENCY_HALF_LIFE_MS);
-  }
-
-  querySimilarWithFeatures(features) {
-    if (!this.isEnabled()) return null;
-    const now = Date.now();
-    const candidates = this.records.filter(r =>
-      r.symbol === features.symbol &&
-      r.outcome !== null &&
-      (now - r.timestamp) > LEARNING_MEMORY_OUTCOME_DELAY_MS
-    );
-    if (candidates.length < LEARNING_MEMORY_MIN_SAMPLES) return null;
-
-    const scales = this.buildSimilarityScales(features, candidates);
-    const scored = candidates.map(r => {
-      const dist = this.similarityWithScales(features, r.context, scales);
-      const similarityWeight = this.similarityWeight(dist);
-      const recencyWeight = this.recencyWeight(r.timestamp);
-      return {
-        ...r,
-        dist,
-        similarityWeight,
-        recencyWeight,
-        weight: similarityWeight * recencyWeight,
-      };
-    });
-    scored.sort((a, b) => a.dist - b.dist);
-    const top = scored.slice(0, LEARNING_MEMORY_LOOKBACK);
-    const weighted = top.reduce((acc, record) => {
-      if (record.outcome === 'success') acc.success += record.weight;
-      if (record.outcome !== null) acc.total += record.weight;
-      return acc;
-    }, { success: 0, total: 0 });
-    if (weighted.total <= 0) return null;
-
-    const successes = top.filter(r => r.outcome === 'success').length;
-    const ratio = successes / top.length;
-    const weightedRatio = weighted.success / weighted.total;
-    const nearest = top[0];
-    return {
-      ratio,
-      weightedRatio,
-      samples: top.length,
-      weightedSamples: roundNumber(weighted.total, 4),
-      closestDistance: roundNumber(nearest?.dist, 4),
-    };
-  }
-
-  updateOutcomes(symbol, currentProfit, profitThreshold) {
-    if (!this.isEnabled()) return;
-    const now = Date.now();
-    let updated = false;
-    const threshold = Number.isFinite(profitThreshold) ? profitThreshold : 0;
-    for (const record of this.records) {
-      if (record.symbol !== symbol) continue;
-      if (record.outcome !== null) continue;
-      if (now - record.timestamp < LEARNING_MEMORY_OUTCOME_DELAY_MS) continue;
-      if (record.profitAtDecision === null) continue;
-      const profitChange = currentProfit - record.profitAtDecision;
-      record.outcome = profitChange > threshold ? 'success' : 'failure';
-      record.outcomeAt = now;
-      record.outcomeDelta = profitChange;
-      updated = true;
+  getOrderSizeUsdt() {
+    if (GRID_TOTAL_INVESTMENT_USDT > 0) {
+      return GRID_TOTAL_INVESTMENT_USDT / Math.max(GRID_COUNT, 1);
     }
-    if (updated) this.save();
-  }
-
-  enrichContext(context, candleSummary) {
-    const features = this.extractFeatures(context);
-    features.symbol = context.symbol || 'unknown';
-    this.enrichContextFeatures(features, candleSummary);
-    return features;
+    return GRID_ORDER_SIZE_USDT;
   }
 }
 
@@ -935,48 +766,10 @@ class AIGridValidator {
     } else {
       this.learningMemory = null;
     }
-    // Tracks consecutive memory-driven blocks per symbol, and when we last allowed an
-    // "explore" trade despite a memory-driven block. See shouldExploreDespiteMemoryBlock().
-    this.memoryBlockStreak = new Map();
-    this.lastExploreAt = new Map();
   }
 
   static allow(reason = 'AI validation disabled') {
     return { allowTrading: true, allowBuy: true, allowSell: true, confidence: 100, reason };
-  }
-
-  // Anti death-spiral safeguard for the learning memory feature.
-  //
-  // Problem: if memory pushes confidence below AI_MIN_CONFIDENCE and trading is blocked,
-  // no new trade happens for that situation -> no new outcome data is generated for it ->
-  // the model never gets fresh evidence that conditions may have improved -> the same
-  // memory-driven block keeps reinforcing itself indefinitely.
-  //
-  // Fix: after LEARNING_MEMORY_EXPLORE_AFTER_BLOCKS consecutive memory-driven blocks for a
-  // symbol (subject to a cooldown so we don't explore every cycle), allow one trade through
-  // anyway so the memory store gets a fresh, real outcome to learn from. This intentionally
-  // does NOT bypass STOP_LOSS/TAKE_PROFIT/kill-switch/circuit-breaker -- only the
-  // memory-driven confidence penalty.
-  shouldExploreDespiteMemoryBlock(symbol) {
-    if (LEARNING_MEMORY_EXPLORE_AFTER_BLOCKS <= 0) return false;
-    const streak = this.memoryBlockStreak.get(symbol) || 0;
-    if (streak < LEARNING_MEMORY_EXPLORE_AFTER_BLOCKS) return false;
-    const lastExplore = this.lastExploreAt.get(symbol) || 0;
-    if (Date.now() - lastExplore < LEARNING_MEMORY_EXPLORE_COOLDOWN_MS) return false;
-    return true;
-  }
-
-  recordMemoryBlockOutcome(symbol, wasMemoryBlocked, didExplore) {
-    if (didExplore) {
-      this.memoryBlockStreak.set(symbol, 0);
-      this.lastExploreAt.set(symbol, Date.now());
-      return;
-    }
-    if (wasMemoryBlocked) {
-      this.memoryBlockStreak.set(symbol, (this.memoryBlockStreak.get(symbol) || 0) + 1);
-    } else {
-      this.memoryBlockStreak.set(symbol, 0);
-    }
   }
 
   static block(reason, confidence = 0) {
@@ -998,10 +791,6 @@ class AIGridValidator {
       decision.allowSell = false;
       decision.reason = `Auto-blocked: confidence too low (${conf.toFixed(1)}%) - extreme uncertainty`;
     } else if (conf < 70) {
-      // Medium-confidence tier: apply allowTrading mask to both sides so that if the
-      // AI already set allowTrading=false, buys and sells are both blocked. When
-      // allowTrading=true but we're in a moderate-confidence band, preserve whatever
-      // directional signal the AI gave (allowBuy / allowSell already reflect trend bias).
       decision.allowBuy = decision.allowTrading && decision.allowBuy;
       decision.allowSell = decision.allowTrading && decision.allowSell;
     }
@@ -1057,9 +846,6 @@ class AIGridValidator {
     const entry = AIGridValidator.lastDecisionBySymbol.get(symbol);
     if (!entry) return null;
     const age = Date.now() - entry.at;
-    // allowStale=true is used during Gemini rate-limit backoff so the bot can continue
-    // operating on the last known decision rather than blocking all trading entirely.
-    // It intentionally bypasses the TTL — callers must document that they accept stale data.
     if (allowStale || age < AI_VALIDATION_CACHE_TTL_MS) return entry;
     return null;
   }
@@ -1184,13 +970,10 @@ Be conservative. Protect capital first.
     };
   }
 
-  async validate(symbol, context, options = {}, profit = null) {
+  async validate(symbol, context, options = {}) {
     if (!AI_VALIDATION_ENABLED) {
       const decision = AIGridValidator.allow();
       this.rememberDecision(symbol, decision);
-      if (this.learningMemory) {
-        this.learningMemory.recordDecision(symbol, context, decision, profit);
-      }
       return decision;
     }
 
@@ -1229,14 +1012,7 @@ Be conservative. Protect capital first.
           );
           decision = this.parseResponse(result.response.text());
           this.applyConfidenceRules(decision);
-          // applyConfidenceRules() already fully blocks trading when confidence < 50
-          // (extreme uncertainty) and otherwise masks allowBuy/allowSell for the medium
-          // tier (50-69.9%) while preserving the AI's directional signal. Only escalate
-          // to a full block here when neither direction survived that masking --
-          // otherwise this would override the medium tier's masking with an
-          // unconditional block whenever AI_MIN_CONFIDENCE >= 70 (the default),
-          // making that tier dead code.
-          if (decision.confidence < AI_MIN_CONFIDENCE && !decision.allowBuy && !decision.allowSell) {
+          if (decision.confidence < AI_MIN_CONFIDENCE) {
             decision = this.blockAndRemember(
               symbol,
               cacheKey,
@@ -1262,49 +1038,26 @@ Be conservative. Protect capital first.
 
       // ---- Learning Memory Integration ----
       if (this.learningMemory && decision) {
-        const features = this.learningMemory.enrichContext(context, candleSummary);
-        features.symbol = symbol;
-        const queryResult = this.learningMemory.querySimilarWithFeatures(features);
-        let wasMemoryBlocked = false;
-        let didExplore = false;
-        if (queryResult && queryResult.samples >= LEARNING_MEMORY_MIN_SAMPLES) {
-          const successRatio = Number.isFinite(queryResult.weightedRatio) ? queryResult.weightedRatio : queryResult.ratio;
-          const factor = 0.85 + (successRatio * 0.3);
-          const oldConfidence = decision.confidence;
-          decision.confidence = Math.min(100, Math.max(0, decision.confidence * factor));
-          const direction = factor > 1 ? 'boosted' : (factor < 1 ? 'reduced' : 'unchanged');
-          const pctSuccess = (successRatio * 100).toFixed(0);
-          decision.reason += ` | Memory: ${pctSuccess}% weighted success (${queryResult.samples} samples, closest=${queryResult.closestDistance}) -> confidence ${oldConfidence.toFixed(1)} -> ${decision.confidence.toFixed(1)} (${direction}, x${factor.toFixed(2)})`;
-          console.log(
-            `[MEMORY] ${symbol} weighted success ${pctSuccess}% (${queryResult.samples} samples, weighted=${queryResult.weightedSamples}) ` +
-            `-> confidence ${oldConfidence.toFixed(1)} -> ${decision.confidence.toFixed(1)} (factor=${factor.toFixed(2)})`
-          );
+        const factor = this.learningMemory.getAdjustment(symbol);
+        if (factor !== 1.0) {
+          const oldConf = decision.confidence;
+          decision.confidence = Math.min(100, decision.confidence * factor);
+          decision.reason += ` | Memory: factor=${factor.toFixed(2)} (${oldConf.toFixed(1)} → ${decision.confidence.toFixed(1)})`;
+          console.log(`[MEMORY] ${symbol} confidence adjusted by x${factor.toFixed(2)}`);
+
+          // Re‑apply confidence rules after adjustment
+          this.applyConfidenceRules(decision);
           if (decision.confidence < AI_MIN_CONFIDENCE) {
-            wasMemoryBlocked = true;
-            if (this.shouldExploreDespiteMemoryBlock(symbol)) {
-              didExplore = true;
-              console.warn(
-                `[MEMORY] ${symbol} forcing an exploratory trade after ` +
-                `${this.memoryBlockStreak.get(symbol)} consecutive memory-driven blocks, ` +
-                `to avoid a permanent self-reinforcing block (LEARNING_MEMORY_EXPLORE_AFTER_BLOCKS=${LEARNING_MEMORY_EXPLORE_AFTER_BLOCKS}).`
-              );
-              decision.reason += ' | Memory: exploratory trade allowed to refresh stale block';
-            } else {
-              decision = AIGridValidator.block(
-                `Low AI confidence after memory adjustment: ${decision.reason}`,
-                decision.confidence
-              );
-              decision.allowBuy = false;
-              decision.allowSell = false;
-            }
+            decision = AIGridValidator.block(
+              `Low confidence after memory adjustment: ${decision.reason}`,
+              decision.confidence
+            );
           }
+          this.setCached(cacheKey, decision);
+          this.rememberDecision(symbol, decision);
         }
-        this.recordMemoryBlockOutcome(symbol, wasMemoryBlocked, didExplore);
-        this.learningMemory.recordDecision(symbol, context, decision, profit, features);
-        this.setCached(cacheKey, decision);
-        this.rememberDecision(symbol, decision);
       }
-      // ------------------------------------
+      // ------------------------------------------------
 
       return decision;
     } catch (err) {
@@ -1328,12 +1081,12 @@ class SpotGridEngine {
     this.aiValidator = new AIGridValidator(this.exchange);
     this.state = new GridState();
     this.isRunning = false;
-    // Per-symbol async mutex — ensures only one reconcileSymbol() runs per symbol at a time
-    // even if a slow exchange call causes the interval timer to fire again mid-cycle.
     this.symbolLocks = new Map();
     this.pendingOrderLevels = new Set();
     this.rangeResetSymbols = new Set();
     this.circuitBreaker = { errors: 0, pausedUntil: 0 };
+    // for stuck investment warning deduplication
+    this.stuckInvestmentWarned = new Set();
   }
 
   async init() {
@@ -1351,11 +1104,6 @@ class SpotGridEngine {
     }
   }
 
-  // Proactively check at startup whether the configured per-grid order size can ever
-  // satisfy this symbol's exchange minimum notional. validateRuntimeConfiguration() only
-  // compares GRID_TOTAL_INVESTMENT_USDT/GRID_COUNT against GRID_ORDER_SIZE_USDT, which does
-  // NOT know the exchange's actual per-symbol minCost -- so this gap can otherwise pass
-  // validation and only surface as a silent, permanent "investment cap reached" skip later.
   warnIfPerGridSizeBelowMinCost(symbol) {
     const minCost = this.getMinCost(symbol);
     if (!(minCost > 0)) return;
@@ -1396,12 +1144,6 @@ class SpotGridEngine {
       return GRID_TOTAL_INVESTMENT_USDT / Math.max(GRID_COUNT, 1);
     }
     return GRID_ORDER_SIZE_USDT;
-  }
-
-  getLearningMemoryProfitThreshold() {
-    // Auto-scale with the grid size so smaller bots do not need a manual env tweak.
-    // Defaults to 0.5% of per-grid notional, with a small floor to avoid noise.
-    return Math.max(0.1, this.getOrderSizeUsdt() * (LEARNING_MEMORY_PROFIT_THRESHOLD_PCT / 100));
   }
 
   isStoredRangeStale(symbol, currentPrice, lower, upper) {
@@ -1558,13 +1300,6 @@ class SpotGridEngine {
     symState.lastBuyByLevel = shiftedBuys;
   }
 
-  // Merges two buy records into a weighted-average position. This is mathematically
-  // correct for overall cost-basis accounting, but when called from a trailing shift to
-  // collapse multiple original grid levels into one boundary level, the resulting price/
-  // level association no longer reflects any single real fill. We mark the merged record
-  // so downstream consumers (logs, reports) know its per-level price is now an aggregate,
-  // not a single fill price -- total realized profit accounting is unaffected since that
-  // is always derived from actual trade fills, not from this aggregated record.
   mergeBuyRecords(existing, incoming, { aggregatedAcrossLevels = false } = {}) {
     if (!existing) {
       return aggregatedAcrossLevels ? { ...incoming, aggregated: true } : { ...incoming };
@@ -1621,14 +1356,12 @@ class SpotGridEngine {
   }
 
   async applyTrailingRangeShift(symbol, lower, upper, shift, direction) {
-    // 1. Cancel existing grid orders first (so we don't leave stale orders if something fails)
     const cancelResult = await this.cancelGridOrders(symbol, `trailing-${direction}`);
     if (cancelResult.failed.length > 0) {
       const failedIds = cancelResult.failed.map(failure => failure.id).join(', ');
       throw new Error(`Trailing ${direction} shift aborted; failed to cancel grid orders: ${failedIds}`);
     }
 
-    // 2. Now update state
     const symState = this.state.getSymbol(symbol);
     const trailingState = direction === 'up'
       ? this.getTrailingUpState(symbol)
@@ -1959,7 +1692,6 @@ class SpotGridEngine {
     let cleaned = 0;
     for (const orderId of Object.keys(symState.orders)) {
       if (!openOrderIds.has(orderId)) {
-        // Order is gone from the exchange (filled, cancelled, or removed manually)
         delete symState.orders[orderId];
         cleaned++;
       }
@@ -2002,7 +1734,6 @@ class SpotGridEngine {
     const sellLevelIndex = levelIndex + 1;
     const sellPrice = levels[sellLevelIndex];
 
-    // Total sellable amount from lastBuyByLevel (already merged by mergeBuyRecords)
     const totalSellable = Math.max(0, Number(symState.lastBuyByLevel[levelIndex]?.sellableAmount ?? symState.lastBuyByLevel[levelIndex]?.amount) || 0);
     if (!(totalSellable > 0)) {
       console.warn(`[SKIP] ${symbol} SELL refill level=${sellLevelIndex} | sellable amount zero after fee`);
@@ -2018,24 +1749,18 @@ class SpotGridEngine {
       return;
     }
 
-    // Sync local state with the exchange before checking hasActiveOrderAtLevel,
-    // so a manually removed order doesn't block re-placement
     this.syncManagedOrdersWithExchange(symbol, symState, openOrderIds);
 
-    // If a sell order is already active at this level, check whether its amount needs updating
     if (this.hasActiveOrderAtLevel(symState, 'sell', sellLevelIndex)) {
-      // Find the existing active order at this level
       const existingOrder = Object.values(symState.orders).find(o =>
         String(o.side).toLowerCase() === 'sell' && Number(o.levelIndex) === sellLevelIndex
       );
       const existingAmount = Number(existingOrder?.amount || 0);
 
-      // Work out the difference: how much new amount needs to be added
       const { preciseAmount: preciseTotalSellable } = this.getPreciseOrderNumbers(symbol, sellPrice, totalSellable);
       const preciseTotalNum = Number(preciseTotalSellable);
 
       if (existingOrder && preciseTotalNum > existingAmount + 1e-8) {
-        // New buy added extra amount — cancel the old order and re-place with the total amount
         console.log(
           `[UPDATE] ${symbol} SELL level=${sellLevelIndex} | amount update ${existingAmount} -> ${preciseTotalNum} (buy accumulated)`
         );
@@ -2090,6 +1815,13 @@ class SpotGridEngine {
     const allocatedBuyCost = buy.totalCostQuote * proportion;
     const allocatedBuyFee = buy.totalFeeQuote * proportion;
     const profit = (proceedsQuote - feeQuote) - (allocatedBuyCost + allocatedBuyFee);
+
+    // ---- Record profit for learning memory ----
+    if (this.aiValidator.learningMemory) {
+      this.aiValidator.learningMemory.recordProfit(symbol, profit);
+    }
+    // -------------------------------------------
+
     symState.realizedGridProfit += profit;
     this.state.data.totals.realizedGridProfit += profit;
     this.state.data.totals.filledSells++;
@@ -2097,14 +1829,12 @@ class SpotGridEngine {
     const remainingSellable = sellableAtBuy - amount;
     if (remainingSellable > 0) {
       const newProportion = remainingSellable / sellableAtBuy;
-      // Spread to a new object before mutating so that callers holding a reference
-      // to the old buy object don't observe unexpected mutations.
       symState.lastBuyByLevel[buyLevelIndex] = {
         ...buy,
         sellableAmount: remainingSellable,
         totalCostQuote: buy.totalCostQuote * newProportion,
         totalFeeQuote: buy.totalFeeQuote * newProportion,
-        amount: remainingSellable,
+        amount: (Number(buy.amount) || 0) * newProportion,
       };
     } else {
       delete symState.lastBuyByLevel[buyLevelIndex];
@@ -2173,10 +1903,6 @@ class SpotGridEngine {
       allTrades = allTrades.concat(trades);
       const lastTimestamp = trades[trades.length - 1].timestamp;
       if (trades.length < TRADE_FETCH_LIMIT) break;
-      // CCXT pagination is timestamp-based here; if many fills share one timestamp,
-      // processedTrade() handles duplicates but the exchange may not expose a stable
-      // cursor for every trade in that timestamp bucket. We log a warning so operators
-      // can detect high-volume conditions where fills might be missed in a bucket.
       if (lastTimestamp === from) {
         if (trades.length >= TRADE_FETCH_LIMIT) {
           console.warn(
@@ -2225,11 +1951,6 @@ class SpotGridEngine {
         this.state.markProcessedTrade(symbol, id);
       }
     }
-    // Clean up local state for orders that no longer exist on the exchange
-    // (e.g. deleted manually, cancelled outside the bot, etc.)
-    // IMPORTANT: run this AFTER processing trades above, otherwise a buy order
-    // that just got fully filled (and thus disappeared from openOrders) would
-    // get its local state wiped before handleBuyFill() can place the sell order.
     this.syncManagedOrdersWithExchange(symbol, symState, openOrderIds);
   }
 
@@ -2270,34 +1991,36 @@ class SpotGridEngine {
     let { currentPrice, balance, lower, upper, levels } = context;
 
     const canContinue = await this.enforceRangeExits(symbol, currentPrice);
-    if (!canContinue) return;
 
-    const trailedUp = await this.maybeTrailUpRange(symbol, currentPrice, lower, upper);
+    let trailedUp = null;
     let trailedDown = null;
     let newContext = null;
-    if (trailedUp) {
-      newContext = await this.fetchContext(symbol);
-      newContext.trailingUpJustShifted = true;
-      ({ currentPrice, balance, lower, upper, levels } = newContext);
-    } else {
-      trailedDown = await this.maybeTrailDownRange(symbol, currentPrice, lower, upper);
-      if (trailedDown) {
+    if (canContinue) {
+      trailedUp = await this.maybeTrailUpRange(symbol, currentPrice, lower, upper);
+      if (trailedUp) {
         newContext = await this.fetchContext(symbol);
-        newContext.trailingDownJustShifted = true;
+        newContext.trailingUpJustShifted = true;
         ({ currentPrice, balance, lower, upper, levels } = newContext);
+      } else {
+        trailedDown = await this.maybeTrailDownRange(symbol, currentPrice, lower, upper);
+        if (trailedDown) {
+          newContext = await this.fetchContext(symbol);
+          newContext.trailingDownJustShifted = true;
+          ({ currentPrice, balance, lower, upper, levels } = newContext);
+        }
       }
     }
     const finalContext = newContext || context;
     finalContext.trailingUpJustShifted = !!trailedUp;
     finalContext.trailingDownJustShifted = !!trailedDown;
 
-    const symState = this.state.getSymbol(symbol);
-    const aiDecision = await this.aiValidator.validate(
-      symbol,
-      finalContext,
-      { ignoreMinInterval: !!(trailedUp || trailedDown) },
-      symState.realizedGridProfit
-    );
+    const aiDecision = canContinue
+      ? await this.aiValidator.validate(
+          symbol,
+          finalContext,
+          { ignoreMinInterval: !!(trailedUp || trailedDown) }
+        )
+      : AIGridValidator.block('Trading halted: stop-loss/take-profit boundary reached');
     if (AI_VALIDATION_ENABLED) {
       console.log(
         `[AI] ${symbol}${trailedUp ? ' trailing-up' : ''}${trailedDown ? ' trailing-down' : ''} ` +
@@ -2306,15 +2029,18 @@ class SpotGridEngine {
       );
     }
 
+    // Always reconcile fills that already happened on the exchange, even while trading
+    // is halted by stop-loss/take-profit, so profit, sellable amount, and lastBuyByLevel
+    // never go unrecorded.
     await this.handleFilledTrades(symbol, levels, aiDecision);
 
-    if (this.aiValidator.learningMemory) {
-      this.aiValidator.learningMemory.updateOutcomes(
-        symbol,
-        symState.realizedGridProfit,
-        this.getLearningMemoryProfitThreshold()
-      );
+    if (!canContinue) {
+      console.log(`[SYNC] ${symbol} trading halted (stop-loss/take-profit); no new orders will be placed`);
+      return;
     }
+
+    // The learning memory profit outcomes are updated immediately via recordProfit in handleSellFill,
+    // so no extra updateOutcomes call needed.
 
     // Re-read balances after any refill orders so placement loops use fresh funds.
     balance = await retry(() => this.exchange.fetchBalance());
@@ -2343,8 +2069,6 @@ class SpotGridEngine {
       if (order.side === 'buy') activeBuyLevels.add(idx);
       if (order.side === 'sell') activeSellLevels.add(idx);
     }
-    // Add all orders from local state into activeLevels to avoid double-placing,
-    // including older orders that are still active on the exchange
     for (const order of Object.values(this.state.getSymbol(symbol).orders)) {
       if (order.side === 'buy') activeBuyLevels.add(Number(order.levelIndex));
       if (order.side === 'sell') activeSellLevels.add(Number(order.levelIndex));
@@ -2468,15 +2192,9 @@ class SpotGridEngine {
     return notional / price;
   }
 
-  // GRID_TOTAL_INVESTMENT_USDT can leave a small leftover (e.g. $3) that is below the
-  // exchange's minimum order cost (e.g. $5). When that happens, this remaining amount
-  // can NEVER be used to place a buy order again until profit from a sell adds more
-  // funds back in -- it is not a transient "cap reached" state, it is permanently stuck.
-  // We warn loudly (once per symbol) so this isn't mistaken for ordinary cap-reached skips.
   warnIfInvestmentPermanentlyStuck(symbol, availableInvestmentUsdt, minCost) {
     if (!(GRID_TOTAL_INVESTMENT_USDT > 0)) return;
     if (!(availableInvestmentUsdt > 0) || availableInvestmentUsdt >= minCost) return;
-    if (!this.stuckInvestmentWarned) this.stuckInvestmentWarned = new Set();
     if (this.stuckInvestmentWarned.has(symbol)) return;
     this.stuckInvestmentWarned.add(symbol);
     console.warn(
