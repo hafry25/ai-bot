@@ -1229,7 +1229,14 @@ Be conservative. Protect capital first.
           );
           decision = this.parseResponse(result.response.text());
           this.applyConfidenceRules(decision);
-          if (decision.confidence < AI_MIN_CONFIDENCE) {
+          // applyConfidenceRules() already fully blocks trading when confidence < 50
+          // (extreme uncertainty) and otherwise masks allowBuy/allowSell for the medium
+          // tier (50-69.9%) while preserving the AI's directional signal. Only escalate
+          // to a full block here when neither direction survived that masking --
+          // otherwise this would override the medium tier's masking with an
+          // unconditional block whenever AI_MIN_CONFIDENCE >= 70 (the default),
+          // making that tier dead code.
+          if (decision.confidence < AI_MIN_CONFIDENCE && !decision.allowBuy && !decision.allowSell) {
             decision = this.blockAndRemember(
               symbol,
               cacheKey,
@@ -1921,11 +1928,11 @@ class SpotGridEngine {
   }
 
   getBaseAsset(symbol) {
-    return symbol.split('/')[0];
+    return symbol.split('/')[0].toUpperCase();
   }
 
   getQuoteAsset(symbol) {
-    return symbol.split('/')[1].split(':')[0];
+    return symbol.split('/')[1].split(':')[0].toUpperCase();
   }
 
   getMinCost(symbol) {
