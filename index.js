@@ -126,6 +126,13 @@ const LEARNING_MEMORY_FILE = Config.get('LEARNING_MEMORY_FILE', 'learning-memory
 const LEARNING_MEMORY_PATH = path.resolve(process.cwd(), LEARNING_MEMORY_FILE);
 const LEARNING_MEMORY_LOOKBACK = Config.number('LEARNING_MEMORY_LOOKBACK', 20);
 const LEARNING_MEMORY_MIN_SAMPLES = Config.number('LEARNING_MEMORY_MIN_SAMPLES', 5);
+// Max penalty Learning Memory can apply to AI confidence (downward only)
+// e.g. 0.3 means confidence can be reduced by at most 30 percentage points
+const LEARNING_MEMORY_MAX_PENALTY = Config.number('LEARNING_MEMORY_MAX_PENALTY', 0.3);
+// Consecutive losses threshold to trigger immediate circuit-breaker block
+const LEARNING_MEMORY_CONSECUTIVE_LOSS_LIMIT = Config.number('LEARNING_MEMORY_CONSECUTIVE_LOSS_LIMIT', 5);
+// Half-life in number of trades for time-weighting (older trades decay exponentially)
+const LEARNING_MEMORY_HALFLIFE_TRADES = Config.number('LEARNING_MEMORY_HALFLIFE_TRADES', 10);
 // ---------------------------------------------------
 
 const MAX_PROCESSED_TRADE_IDS = 2000;
@@ -311,6 +318,11 @@ function validateRuntimeConfiguration() {
         `LEARNING_MEMORY_LOOKBACK (${LEARNING_MEMORY_LOOKBACK})`
       );
     }
+    if (!(LEARNING_MEMORY_MAX_PENALTY > 0) || LEARNING_MEMORY_MAX_PENALTY > 1) {
+      errors.push('LEARNING_MEMORY_MAX_PENALTY must be between 0 (exclusive) and 1 (inclusive)');
+    }
+    requireInteger('LEARNING_MEMORY_CONSECUTIVE_LOSS_LIMIT', LEARNING_MEMORY_CONSECUTIVE_LOSS_LIMIT, 1);
+    requireInteger('LEARNING_MEMORY_HALFLIFE_TRADES', LEARNING_MEMORY_HALFLIFE_TRADES, 1);
   }
 
   const hasLower = GRID_LOWER_PRICE > 0;
@@ -663,7 +675,17 @@ class GridState {
 }
 
 // ------------------------------
-//  Learning Memory 
+//  Learning Memory (improved)
+// ------------------------------
+//
+// Design principles vs original:
+//  1. PENALTY-ONLY  — memory can only reduce AI confidence, never inflate it.
+//     This prevents false confidence when the market regime changes.
+//  2. TIME-WEIGHTED — recent trades have exponentially more weight than old ones
+//     (half-life = LEARNING_MEMORY_HALFLIFE_TRADES).
+//  3. CONSECUTIVE-LOSS CIRCUIT BREAKER — if the last N trades are all losses,
+//     trading is blocked immediately regardless of AI confidence.
+//  4. TRANSPARENT LOGGING — every adjustment is logged with full diagnostics.
 // ------------------------------
 class LearningMemory {
   constructor() {
@@ -671,11 +693,19 @@ class LearningMemory {
     this.enabled = LEARNING_MEMORY_ENABLED;
     this.windowSize = LEARNING_MEMORY_LOOKBACK;
     this.minSamples = LEARNING_MEMORY_MIN_SAMPLES;
-    this.data = {}; // symbol -> { profits: [], totalProfit: 0, count: 0 }
+    this.maxPenalty = LEARNING_MEMORY_MAX_PENALTY;           // max confidence reduction (fraction)
+    this.consecutiveLossLimit = LEARNING_MEMORY_CONSECUTIVE_LOSS_LIMIT;
+    this.halflifeTrades = Math.max(LEARNING_MEMORY_HALFLIFE_TRADES, 1);
+    // symbol -> { entries: [{profit, timestamp}], totalProfit, count }
+    this.data = {};
     if (this.enabled) this.load();
   }
 
   isEnabled() { return this.enabled === true; }
+
+  // ------------------------------------------------------------------
+  //  Persistence
+  // ------------------------------------------------------------------
 
   load() {
     try {
@@ -684,15 +714,33 @@ class LearningMemory {
         const parsed = JSON.parse(raw);
         if (isPlainObject(parsed)) {
           for (const [symbol, record] of Object.entries(parsed)) {
-            if (Array.isArray(record.profits)) {
+            // Support both new format (entries[]) and legacy format (profits[])
+            if (Array.isArray(record.entries)) {
               this.data[symbol] = {
-                profits: record.profits.map(Number).filter(v => Number.isFinite(v)),
+                entries: record.entries
+                  .filter(e => isPlainObject(e) && Number.isFinite(Number(e.profit)))
+                  .map(e => ({ profit: Number(e.profit), ts: Number(e.ts) || Date.now() })),
                 totalProfit: Number(record.totalProfit) || 0,
                 count: Number(record.count) || 0,
               };
+            } else if (Array.isArray(record.profits)) {
+              // Migrate legacy format — assign synthetic timestamps spaced 1 minute apart
+              const now = Date.now();
+              this.data[symbol] = {
+                entries: record.profits
+                  .map(Number)
+                  .filter(v => Number.isFinite(v))
+                  .map((profit, i, arr) => ({
+                    profit,
+                    ts: now - (arr.length - 1 - i) * MINUTE_MS,
+                  })),
+                totalProfit: Number(record.totalProfit) || 0,
+                count: Number(record.count) || 0,
+              };
+              console.log(`[MEMORY] Migrated legacy format for ${symbol} (${this.data[symbol].entries.length} entries).`);
             }
           }
-          console.log(`[MEMORY] Loaded memory for ${Object.keys(this.data).length} symbols.`);
+          console.log(`[MEMORY] Loaded memory for ${Object.keys(this.data).length} symbol(s).`);
         }
       }
     } catch (err) {
@@ -706,7 +754,7 @@ class LearningMemory {
     const toWrite = {};
     for (const [symbol, record] of Object.entries(this.data)) {
       toWrite[symbol] = {
-        profits: record.profits.slice(-this.windowSize),
+        entries: record.entries.slice(-this.windowSize * 2),
         totalProfit: record.totalProfit,
         count: record.count,
       };
@@ -714,59 +762,146 @@ class LearningMemory {
     AtomicFileWriter.write(this.filePath, () => `${JSON.stringify(toWrite, null, 2)}\n`);
   }
 
-  // Call this whenever a sell order is filled with its realised profit
+  // ------------------------------------------------------------------
+  //  Recording
+  // ------------------------------------------------------------------
+
   async recordProfit(symbol, profit) {
     if (!this.isEnabled()) return;
     if (!this.data[symbol]) {
-      this.data[symbol] = { profits: [], totalProfit: 0, count: 0 };
+      this.data[symbol] = { entries: [], totalProfit: 0, count: 0 };
     }
     const record = this.data[symbol];
-    record.profits.push(profit);
-    if (record.profits.length > this.windowSize * 2) {
-      // Keep only the last 2*windowSize to avoid unbounded growth
-      record.profits = record.profits.slice(-this.windowSize * 2);
+    record.entries.push({ profit, ts: Date.now() });
+    // Keep bounded storage: retain last 2*windowSize entries
+    if (record.entries.length > this.windowSize * 2) {
+      record.entries = record.entries.slice(-this.windowSize * 2);
     }
     record.totalProfit += profit;
     record.count += 1;
+    console.log(
+      `[MEMORY] ${symbol} recorded profit=${profit.toFixed(4)} | ` +
+      `total=${record.totalProfit.toFixed(4)} over ${record.count} trades`
+    );
     await this.save();
   }
 
-  // Returns a confidence multiplier factor for the given symbol
-  getAdjustment(symbol) {
-    if (!this.isEnabled()) return 1.0;
+  // ------------------------------------------------------------------
+  //  Core Analytics
+  // ------------------------------------------------------------------
+
+  /**
+   * Exponential decay weight for the i-th entry (0 = oldest in window).
+   * weight(i) = 2^( (i - (n-1)) / halflife )
+   * → most recent entry (i = n-1) always has weight 1.0
+   */
+  _weight(i, n) {
+    return Math.pow(2, (i - (n - 1)) / this.halflifeTrades);
+  }
+
+  /**
+   * Returns { penalty, reason, consecutiveLosses, weightedWinRate, weightedAvgProfit }
+   * penalty is a value in [0, maxPenalty] to SUBTRACT from confidence (0 = no change).
+   */
+  analyze(symbol) {
+    const neutral = { penalty: 0, reason: null, consecutiveLosses: 0, weightedWinRate: null, weightedAvgProfit: null };
+    if (!this.isEnabled()) return neutral;
+
     const record = this.data[symbol];
-    if (!record || record.profits.length < this.minSamples) return 1.0;
+    if (!record || record.entries.length < this.minSamples) return neutral;
 
-    const recent = record.profits.slice(-this.windowSize);
+    const recent = record.entries.slice(-this.windowSize);
     const n = recent.length;
-    if (n < this.minSamples) return 1.0;
+    if (n < this.minSamples) return neutral;
 
-    // Win rate
-    const wins = recent.filter(p => p > 0).length;
-    const winRate = wins / n;
+    // ---- 1. Consecutive loss circuit breaker (unweighted, most recent N) ----
+    let consecutiveLosses = 0;
+    for (let i = n - 1; i >= 0; i--) {
+      if (recent[i].profit <= 0) consecutiveLosses++;
+      else break;
+    }
 
-    // Average profit (relative to order size)
-    const avgProfit = recent.reduce((a, b) => a + b, 0) / n;
+    if (consecutiveLosses >= this.consecutiveLossLimit) {
+      return {
+        penalty: this.maxPenalty,
+        reason: `circuit-breaker: ${consecutiveLosses} consecutive losses`,
+        consecutiveLosses,
+        weightedWinRate: null,
+        weightedAvgProfit: null,
+      };
+    }
+
+    // ---- 2. Time-weighted win rate & avg profit ----
+    let weightSum = 0;
+    let winWeightSum = 0;
+    let profitWeightSum = 0;
     const orderSize = this.getOrderSizeUsdt();
-    const relProfit = orderSize > 0 ? avgProfit / orderSize : 0;
 
-    // Build factor
-    let factor = 1.0;
-    if (winRate > 0.6) {
-      factor += 0.2 * (winRate - 0.6) / 0.4; // max +0.2 when winRate=1.0
-    } else if (winRate < 0.4) {
-      factor -= 0.2 * (0.4 - winRate) / 0.4; // max -0.2 when winRate=0.0
-    }
-    // Small bonus/penalty for average profit magnitude
-    if (relProfit > 0.01) {
-      factor += 0.1 * Math.min(relProfit / 0.1, 0.5); // max +0.1
-    } else if (relProfit < -0.01) {
-      factor -= 0.1 * Math.min(-relProfit / 0.1, 0.5); // max -0.1
+    for (let i = 0; i < n; i++) {
+      const w = this._weight(i, n);
+      weightSum += w;
+      if (recent[i].profit > 0) winWeightSum += w;
+      profitWeightSum += recent[i].profit * w;
     }
 
-    // Clamp between 0.5 and 1.5
-    factor = Math.min(1.5, Math.max(0.5, factor));
-    return factor;
+    const weightedWinRate = weightSum > 0 ? winWeightSum / weightSum : 0;
+    const weightedAvgProfit = weightSum > 0 ? profitWeightSum / weightSum : 0;
+    const relProfit = orderSize > 0 ? weightedAvgProfit / orderSize : 0;
+
+    // ---- 3. Compute penalty (0 = fine, maxPenalty = worst) ----
+    // Only penalise — never reward — Learning Memory.
+    let penalty = 0;
+
+    // Win rate below 40% → scale penalty up to maxPenalty/2
+    if (weightedWinRate < 0.4) {
+      penalty += (this.maxPenalty / 2) * ((0.4 - weightedWinRate) / 0.4);
+    }
+
+    // Negative relative profit → scale additional penalty up to maxPenalty/2
+    if (relProfit < -0.01) {
+      penalty += (this.maxPenalty / 2) * Math.min((-relProfit) / 0.1, 1.0);
+    }
+
+    penalty = Math.min(penalty, this.maxPenalty);
+
+    const reason = penalty > 0
+      ? `low perf: winRate=${(weightedWinRate * 100).toFixed(1)}% relProfit=${(relProfit * 100).toFixed(2)}%`
+      : null;
+
+    return { penalty, reason, consecutiveLosses, weightedWinRate, weightedAvgProfit };
+  }
+
+  // ------------------------------------------------------------------
+  //  Public API — called from AIGridValidator
+  // ------------------------------------------------------------------
+
+  /**
+   * Applies a penalty-only adjustment to `decision` (mutates in place).
+   * Returns the (possibly modified) decision for chaining.
+   */
+  applyTo(symbol, decision) {
+    if (!this.isEnabled()) return decision;
+
+    const { penalty, reason, consecutiveLosses } = this.analyze(symbol);
+
+    if (penalty <= 0 && consecutiveLosses < this.consecutiveLossLimit) {
+      return decision; // nothing to do
+    }
+
+    const oldConf = decision.confidence;
+    const penaltyPoints = penalty * 100; // convert fraction → percentage points
+    decision.confidence = Math.max(0, decision.confidence - penaltyPoints);
+
+    const memoryNote = reason
+      ? `Memory[${symbol}]: -${penaltyPoints.toFixed(1)}pt (${oldConf.toFixed(1)}→${decision.confidence.toFixed(1)}) — ${reason}`
+      : `Memory[${symbol}]: no penalty`;
+
+    decision.reason = decision.reason
+      ? `${decision.reason} | ${memoryNote}`
+      : memoryNote;
+
+    console.log(`[MEMORY] ${memoryNote}`);
+    return decision;
   }
 
   getOrderSizeUsdt() {
@@ -1071,28 +1206,22 @@ Be conservative. Protect capital first.
         }
       }
 
-      // ---- Learning Memory Integration ----
+      // ---- Learning Memory Integration (penalty-only, with circuit breaker) ----
       if (this.learningMemory && decision) {
-        const factor = this.learningMemory.getAdjustment(symbol);
-        if (factor !== 1.0) {
-          const oldConf = decision.confidence;
-          decision.confidence = Math.min(100, decision.confidence * factor);
-          decision.reason += ` | Memory: factor=${factor.toFixed(2)} (${oldConf.toFixed(1)} → ${decision.confidence.toFixed(1)})`;
-          console.log(`[MEMORY] ${symbol} confidence adjusted by x${factor.toFixed(2)}`);
+        this.learningMemory.applyTo(symbol, decision);
 
-          // Re‑apply confidence rules after adjustment
-          this.applyConfidenceRules(decision);
-          if (decision.confidence < AI_MIN_CONFIDENCE) {
-            decision = AIGridValidator.block(
-              `Low confidence after memory adjustment: ${decision.reason}`,
-              decision.confidence
-            );
-          }
-          this.setCached(cacheKey, decision);
-          this.rememberDecision(symbol, decision);
+        // Re-apply confidence rules after memory penalty
+        this.applyConfidenceRules(decision);
+        if (decision.confidence < AI_MIN_CONFIDENCE) {
+          decision = AIGridValidator.block(
+            `Low confidence after memory penalty: ${decision.reason}`,
+            decision.confidence
+          );
         }
+        this.setCached(cacheKey, decision);
+        this.rememberDecision(symbol, decision);
       }
-      // ------------------------------------------------
+      // -----------------------------------------------------------------------
 
       return decision;
     } catch (err) {
@@ -2427,7 +2556,7 @@ Max Active Orders: buy=${GRID_MAX_ACTIVE_BUY_ORDERS}, sell=${GRID_MAX_ACTIVE_SEL
 Recreate On Start: ${GRID_RECREATE_ON_START ? 'ON' : 'OFF'}
 AI Validation: ${AI_VALIDATION_ENABLED ? `ON (${GEMINI_MODEL})` : 'OFF'}
 Post Only (Maker): ${GRID_POST_ONLY ? 'ON' : 'OFF'}
-Learning Memory: ${LEARNING_MEMORY_ENABLED ? 'ON' : 'OFF'}
+Learning Memory: ${LEARNING_MEMORY_ENABLED ? `ON (penalty-only, halflife=${LEARNING_MEMORY_HALFLIFE_TRADES} trades, maxPenalty=${LEARNING_MEMORY_MAX_PENALTY * 100}pt, circuitBreaker=${LEARNING_MEMORY_CONSECUTIVE_LOSS_LIMIT} losses)` : 'OFF'}
 `);
     await this.init();
     while (true) {
