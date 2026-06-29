@@ -508,11 +508,22 @@ class ProcessLock {
 
   release() {
     if (this.fd === null) return;
+    // Capture and clear the token BEFORE closing fd so ownsLock() can't be
+    // called after the file descriptor is invalid.  We verify ownership using
+    // the in-memory token directly rather than re-reading the lock file after
+    // closeSync(), which would introduce a TOCTOU race.
+    const tokenSnapshot = this.ownerToken;
     try {
+      // Check ownership while fd is still open (file content is stable).
+      const isOwner = tokenSnapshot !== null && this.ownsLock();
       fs.closeSync(this.fd);
-      if (this.ownsLock()) {
-        fs.unlinkSync(this.lockPath);
-        console.log(`[LOCK] Released lock ${this.lockPath}`);
+      if (isOwner) {
+        try {
+          fs.unlinkSync(this.lockPath);
+          console.log(`[LOCK] Released lock ${this.lockPath}`);
+        } catch (err) {
+          if (err.code !== 'ENOENT') console.warn('[LOCK] Failed to unlink lock file:', err.message);
+        }
       } else {
         console.warn('[LOCK] Not releasing a lock with a different ownership token');
       }
@@ -886,6 +897,21 @@ class LearningMemory {
 
     if (penalty <= 0 && consecutiveLosses < this.consecutiveLossLimit) {
       return decision; // nothing to do
+    }
+
+    // Hard-block immediately when consecutive-loss circuit breaker fires,
+    // regardless of how high the AI confidence is.
+    if (consecutiveLosses >= this.consecutiveLossLimit) {
+      const blockReason = `Memory[${symbol}]: circuit-breaker triggered — ${consecutiveLosses} consecutive losses (limit=${this.consecutiveLossLimit})`;
+      decision.allowTrading = false;
+      decision.allowBuy = false;
+      decision.allowSell = false;
+      decision.confidence = 0;
+      decision.reason = decision.reason
+        ? `${decision.reason} | ${blockReason}`
+        : blockReason;
+      console.warn(`[MEMORY] ${blockReason}`);
+      return decision;
     }
 
     const oldConf = decision.confidence;
@@ -2000,7 +2026,7 @@ class SpotGridEngine {
     if (!buy) {
       console.warn(`[SELL] ${symbol} level ${levelIndex} has no corresponding buy record. Skipping profit calculation.`);
       await this.forgetOrderIfClosed(symState, trade, openOrderIds);
-      this.state.markProcessedTrade(symbol, this.getTradeId(trade));
+      await this.state.markProcessedTrade(symbol, this.getTradeId(trade));
       return;
     }
 
@@ -2015,7 +2041,7 @@ class SpotGridEngine {
     if (!(sellableAtBuy > 0)) {
       console.warn(`[SELL] ${symbol} level ${levelIndex} buy record has zero sellable amount. Skipping profit calculation.`);
       await this.forgetOrderIfClosed(symState, trade, openOrderIds);
-      this.state.markProcessedTrade(symbol, this.getTradeId(trade));
+      await this.state.markProcessedTrade(symbol, this.getTradeId(trade));
       return;
     }
     const proportion = Math.min(amount / sellableAtBuy, 1.0);
@@ -2111,15 +2137,20 @@ class SpotGridEngine {
       const lastTimestamp = trades[trades.length - 1].timestamp;
       if (trades.length < TRADE_FETCH_LIMIT) break;
       if (lastTimestamp === from) {
-        if (trades.length >= TRADE_FETCH_LIMIT) {
-          console.warn(
-            `[TRADES] ${symbol} pagination stopped: full page (${TRADE_FETCH_LIMIT}) of trades share ` +
-            `timestamp ${lastTimestamp}. Fills within this timestamp bucket may be partially missed. ` +
-            `processedTrade() deduplication handles re-seen fills, but unseen fills in this bucket ` +
-            `will be picked up on the next cycle if they appear in a subsequent fetch window.`
-          );
-        }
-        break;
+        // A full page of trades all share the same millisecond timestamp.
+        // We cannot safely advance `from` to lastTimestamp+1 because there
+        // may be MORE trades at this exact timestamp on the next page that
+        // the exchange hasn't returned yet.  Stop here and do NOT advance
+        // lastTradeTimestamp — the next cycle will re-fetch from this same
+        // timestamp.  processedTrade() deduplication ensures already-seen
+        // fills are skipped without re-processing.
+        console.warn(
+          `[TRADES] ${symbol} pagination stopped: full page (${TRADE_FETCH_LIMIT}) of trades share ` +
+          `timestamp ${lastTimestamp}. Holding lastTradeTimestamp at ${from} so unseen fills ` +
+          `in this timestamp bucket are picked up on the next cycle.`
+        );
+        // Return what we have but DO NOT update lastTradeTimestamp.
+        return allTrades;
       }
       from = lastTimestamp + 1;
       iteration++;
@@ -2133,7 +2164,7 @@ class SpotGridEngine {
     return allTrades;
   }
 
-  async handleFilledTrades(symbol, levels, aiDecision) {
+  async handleFilledTrades(symbol, levels, aiDecision, preloadedOpenOrders = null) {
     const symState = this.state.getSymbol(symbol);
     const quoteAsset = this.getQuoteAsset(symbol);
 
@@ -2151,9 +2182,12 @@ class SpotGridEngine {
         .map(t => this.cacheFeeTokenPrice(t, quoteAsset))
     );
 
+    // Reuse caller-supplied openOrders when available to avoid an extra round-trip.
     const [trades, openOrders] = await Promise.all([
       this.fetchNewTrades(symbol, symState),
-      retry(() => this.exchange.fetchOpenOrders(symbol)),
+      preloadedOpenOrders
+        ? Promise.resolve(preloadedOpenOrders)
+        : retry(() => this.exchange.fetchOpenOrders(symbol)),
     ]);
     const openOrderIds = new Set(openOrders.map(order => String(order.id)));
     for (const trade of trades.sort((a, b) => a.timestamp - b.timestamp)) {
@@ -2187,7 +2221,7 @@ class SpotGridEngine {
             `[SKIP] ${symbol} trade ${id}: order ${trade.order} not in state and ` +
             `no parseable clientOrderId – fill cannot be attributed to a grid level`
           );
-          this.state.markProcessedTrade(symbol, id);
+          await this.state.markProcessedTrade(symbol, id);
           continue;
         }
       }
@@ -2200,7 +2234,7 @@ class SpotGridEngine {
         await this.handleSellFill(symbol, levels, aiDecision, symState, trade, orderMeta_final, openOrderIds);
       } else {
         await this.forgetOrderIfClosed(symState, trade, openOrderIds);
-        this.state.markProcessedTrade(symbol, id);
+        await this.state.markProcessedTrade(symbol, id);
       }
     }
     await this.syncManagedOrdersWithExchange(symbol, symState, openOrderIds);
@@ -2284,7 +2318,10 @@ class SpotGridEngine {
     // Always reconcile fills that already happened on the exchange, even while trading
     // is halted by stop-loss/take-profit, so profit, sellable amount, and lastBuyByLevel
     // never go unrecorded.
-    await this.handleFilledTrades(symbol, levels, aiDecision);
+    // Fetch openOrders once here and pass it into handleFilledTrades so we avoid a
+    // redundant exchange round-trip (handleFilledTrades previously fetched its own copy).
+    let freshOpenOrders = await retry(() => this.exchange.fetchOpenOrders(symbol));
+    await this.handleFilledTrades(symbol, levels, aiDecision, freshOpenOrders);
 
     if (!canContinue) {
       console.log(`[SYNC] ${symbol} trading halted (stop-loss/take-profit); no new orders will be placed`);
@@ -2294,9 +2331,9 @@ class SpotGridEngine {
     // The learning memory profit outcomes are updated immediately via recordProfit in handleSellFill,
     // so no extra updateOutcomes call needed.
 
-    // Re-read balances after any refill orders so placement loops use fresh funds.
+    // Re-read balances and open orders after fill handling so placement loops use fresh state.
     balance = await retry(() => this.exchange.fetchBalance());
-    let freshOpenOrders = await retry(() => this.exchange.fetchOpenOrders(symbol));
+    freshOpenOrders = await retry(() => this.exchange.fetchOpenOrders(symbol));
     let managedOrders = await this.getManagedOpenOrders(symbol, freshOpenOrders);
 
     if (GRID_CANCEL_OUT_OF_RANGE) {
@@ -2417,13 +2454,24 @@ class SpotGridEngine {
     if (!(GRID_TOTAL_INVESTMENT_USDT > 0)) return 0;
     const symState = this.state.getSymbol(symbol);
     let allocated = 0;
-    for (const buy of Object.values(symState.lastBuyByLevel)) {
+
+    // Sum cost of all filled buys tracked in lastBuyByLevel.
+    const filledLevels = new Set();
+    for (const [levelIndex, buy] of Object.entries(symState.lastBuyByLevel)) {
       allocated += Number(buy.totalCostQuote) || 0;
+      filledLevels.add(Number(levelIndex));
     }
+
+    // Sum cost of open (pending) buy orders, but ONLY for levels that do NOT
+    // already have a filled buy record in lastBuyByLevel.  An order that has
+    // been filled but whose state entry hasn't been cleaned up yet would
+    // otherwise be double-counted against the investment cap.
     for (const order of Object.values(symState.orders)) {
       if (String(order.side).toLowerCase() !== 'buy') continue;
+      if (filledLevels.has(Number(order.levelIndex))) continue; // already counted via lastBuyByLevel
       allocated += (Number(order.amount) || 0) * (Number(order.price) || 0);
     }
+
     return allocated;
   }
 
