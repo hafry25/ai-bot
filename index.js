@@ -106,6 +106,14 @@ const AI_VALIDATION_TIMEOUT_MS = Math.max(Config.number('AI_VALIDATION_TIMEOUT_M
 const AI_MIN_CONFIDENCE = Config.number('AI_MIN_CONFIDENCE', 70);
 const GEMINI_MODEL = Config.get('GEMINI_MODEL', 'gemini-2.0-flash-lite');
 
+// Auto-disable AI validation on repeated errors (rate limit, quota exceeded, etc.)
+// AI_VALIDATION_AUTO_DISABLE=true  → auto off saat error terdeteksi
+// AI_VALIDATION_AUTO_DISABLE_THRESHOLD → jumlah error berturut-turut sebelum di-off
+// AI_VALIDATION_AUTO_DISABLE_RECOVER_MS → berapa lama sebelum coba re-enable (0 = permanen off)
+const AI_VALIDATION_AUTO_DISABLE = Config.boolean('AI_VALIDATION_AUTO_DISABLE', true);
+const AI_VALIDATION_AUTO_DISABLE_THRESHOLD = Config.number('AI_VALIDATION_AUTO_DISABLE_THRESHOLD', 3);
+const AI_VALIDATION_AUTO_DISABLE_RECOVER_MS = Config.number('AI_VALIDATION_AUTO_DISABLE_RECOVER_MS', 60 * MINUTE_MS);
+
 const STOP_LOSS_PRICE = Config.number('GRID_STOP_LOSS_PRICE', 0);
 const TAKE_PROFIT_PRICE = Config.number('GRID_TAKE_PROFIT_PRICE', 0);
 const KILL_SWITCH_ENABLED = Config.boolean('KILL_SWITCH_ENABLED', false);
@@ -947,6 +955,11 @@ class AIGridValidator {
   static lastDecisionBySymbol = new Map();
   static rateLimitedUntil = 0;
 
+  // --- Auto-disable state ---
+  static autoDisabledAt = 0;         // timestamp saat AI di-disable otomatis (0 = aktif)
+  static autoDisableUntil = 0;       // timestamp kapan boleh recover (0 = belum di-disable)
+  static consecutiveErrors = 0;      // jumlah error berturut-turut sejak sukses terakhir
+
   constructor(exchange) {
     this.exchange = exchange;
     this.model = null;
@@ -1064,6 +1077,82 @@ class AIGridValidator {
       message.includes('resource_exhausted');
   }
 
+  // Returns true jika error ini termasuk kategori yang memicu auto-disable
+  isAutoDisableError(err) {
+    if (this.isRateLimitError(err)) return true;
+    const message = String(err?.message || err || '').toLowerCase();
+    // Quota exceeded, billing, API key invalid, service unavailable
+    return (
+      message.includes('quota') ||
+      message.includes('exceeded') ||
+      message.includes('billing') ||
+      message.includes('api key') ||
+      message.includes('invalid key') ||
+      message.includes('permission') ||
+      message.includes('service unavailable') ||
+      message.includes('503') ||
+      message.includes('overloaded') ||
+      err?.status === 401 ||
+      err?.status === 403 ||
+      err?.status === 503
+    );
+  }
+
+  // Tandai satu error berturut-turut; auto-disable jika threshold tercapai
+  recordAiError(err) {
+    if (!AI_VALIDATION_AUTO_DISABLE) return;
+    AIGridValidator.consecutiveErrors++;
+    const isDisableWorthy = this.isAutoDisableError(err);
+    const overThreshold = AIGridValidator.consecutiveErrors >= AI_VALIDATION_AUTO_DISABLE_THRESHOLD;
+
+    if (isDisableWorthy || overThreshold) {
+      const recoverAt = AI_VALIDATION_AUTO_DISABLE_RECOVER_MS > 0
+        ? Date.now() + AI_VALIDATION_AUTO_DISABLE_RECOVER_MS
+        : Infinity;
+      AIGridValidator.autoDisabledAt = Date.now();
+      AIGridValidator.autoDisableUntil = recoverAt;
+
+      const recoverMsg = AI_VALIDATION_AUTO_DISABLE_RECOVER_MS > 0
+        ? `akan coba recover dalam ${Math.round(AI_VALIDATION_AUTO_DISABLE_RECOVER_MS / MINUTE_MS)}m`
+        : 'harus direstart manual untuk aktif kembali';
+      console.warn(
+        `[AI] ⚠ Auto-disable AI validation dipicu oleh "${err?.message || err}" ` +
+        `(consecutive errors: ${AIGridValidator.consecutiveErrors}, threshold: ${AI_VALIDATION_AUTO_DISABLE_THRESHOLD}) — ${recoverMsg}`
+      );
+    }
+  }
+
+  // Reset counter setelah sukses
+  recordAiSuccess() {
+    if (AIGridValidator.consecutiveErrors > 0) {
+      console.log(`[AI] AI validation sukses — reset consecutive error counter (was ${AIGridValidator.consecutiveErrors})`);
+    }
+    AIGridValidator.consecutiveErrors = 0;
+
+    // Jika sebelumnya auto-disabled tapi sudah lewat recover window, re-enable
+    if (AIGridValidator.autoDisableUntil > 0 && AIGridValidator.autoDisableUntil !== Infinity) {
+      if (Date.now() >= AIGridValidator.autoDisableUntil) {
+        AIGridValidator.autoDisableUntil = 0;
+        AIGridValidator.autoDisabledAt = 0;
+        console.log('[AI] AI validation re-enabled setelah recover window berlalu.');
+      }
+    }
+  }
+
+  // Cek apakah AI validation sedang dalam kondisi auto-disabled
+  isAutoDisabled() {
+    if (!AI_VALIDATION_AUTO_DISABLE) return false;
+    if (AIGridValidator.autoDisableUntil === 0) return false;
+    if (AIGridValidator.autoDisableUntil === Infinity) return true; // permanen sampai restart
+    if (Date.now() < AIGridValidator.autoDisableUntil) return true;
+    // Sudah lewat recover window → re-enable otomatis
+    console.log('[AI] AI validation recover window selesai — re-enabling AI validation.');
+    AIGridValidator.autoDisableUntil = 0;
+    AIGridValidator.autoDisabledAt = 0;
+    AIGridValidator.consecutiveErrors = 0;
+    return false;
+  }
+
   summarizeCandles(ohlcv) {
     if (!ohlcv.length) return {};
     const closes = ohlcv.map(c => Number(c[4]));
@@ -1173,6 +1262,21 @@ Be conservative. Protect capital first.
       return decision;
     }
 
+    // --- Auto-disable check ---
+    if (this.isAutoDisabled()) {
+      const disabledSec = Math.round((Date.now() - AIGridValidator.autoDisabledAt) / 1000);
+      const recoverInfo = AIGridValidator.autoDisableUntil === Infinity
+        ? 'restart bot untuk aktifkan kembali'
+        : `recover dalam ~${Math.max(0, Math.round((AIGridValidator.autoDisableUntil - Date.now()) / MINUTE_MS))}m`;
+      const reason = `AI validation auto-disabled setelah error berulang (${disabledSec}s lalu; ${recoverInfo})`;
+      const stale = this.getLastDecision(symbol, true);
+      if (stale) {
+        console.warn(`[AI] ${reason} — menggunakan keputusan terakhir yang tersimpan`);
+        return stale;
+      }
+      return AIGridValidator.allow(reason);
+    }
+
     const { ignoreMinInterval = false } = options;
     const cacheKey = this.cacheKey(symbol, context.currentPrice, context.levels);
     if (!ignoreMinInterval) {
@@ -1219,15 +1323,20 @@ Be conservative. Protect capital first.
             this.setCached(cacheKey, decision);
             this.rememberDecision(symbol, decision);
           }
+          this.recordAiSuccess(); // reset error counter setelah sukses
           break;
         } catch (err) {
           if (this.isRateLimitError(err)) {
             AIGridValidator.rateLimitedUntil = Date.now() + AI_VALIDATION_BACKOFF_MS;
+            this.recordAiError(err); // catat untuk auto-disable
             const stale = this.getLastDecision(symbol, true);
             if (stale) return stale;
             throw err;
           }
-          if (attempt > AI_VALIDATION_RETRIES) throw err;
+          if (attempt > AI_VALIDATION_RETRIES) {
+            this.recordAiError(err); // catat error final setelah semua retry habis
+            throw err;
+          }
           await sleep(1000 * attempt);
         }
       }
@@ -1251,12 +1360,16 @@ Be conservative. Protect capital first.
 
       return decision;
     } catch (err) {
-      const reason = this.isRateLimitError(err)
+      const isRateLimit = this.isRateLimitError(err);
+      const reason = isRateLimit
         ? `AI validation rate-limited; paused Gemini calls for ${Math.round(AI_VALIDATION_BACKOFF_MS / MINUTE_MS)}m`
         : `AI validation failed: ${err.message}`;
-      if (this.isRateLimitError(err)) {
+      if (isRateLimit) {
         AIGridValidator.rateLimitedUntil = Date.now() + AI_VALIDATION_BACKOFF_MS;
       }
+      // recordAiError sudah dipanggil di inner loop saat retry habis/rate limit
+      // Tapi jika error di luar loop (misal fetchOHLCV), catat di sini
+      if (!isRateLimit) this.recordAiError(err);
       return this.blockAndRemember(symbol, cacheKey, reason);
     }
   }
@@ -2602,7 +2715,7 @@ Trailing Up: ${GRID_TRAILING_UP_ENABLED ? `ON (range-follow trigger, cooldown=${
 Trailing Down: ${GRID_TRAILING_DOWN_ENABLED ? `ON (range-follow trigger, cooldown=${GRID_TRAILING_DOWN_COOLDOWN_MS / MINUTE_MS}m)` : 'OFF'}
 Max Active Orders: buy=${GRID_MAX_ACTIVE_BUY_ORDERS}, sell=${GRID_MAX_ACTIVE_SELL_ORDERS}
 Recreate On Start: ${GRID_RECREATE_ON_START ? 'ON' : 'OFF'}
-AI Validation: ${AI_VALIDATION_ENABLED ? `ON (${GEMINI_MODEL})` : 'OFF'}
+AI Validation: ${AI_VALIDATION_ENABLED ? `ON (${GEMINI_MODEL})` : 'OFF'}${AI_VALIDATION_ENABLED && AI_VALIDATION_AUTO_DISABLE ? ` [auto-disable: threshold=${AI_VALIDATION_AUTO_DISABLE_THRESHOLD} errors, recover=${AI_VALIDATION_AUTO_DISABLE_RECOVER_MS > 0 ? Math.round(AI_VALIDATION_AUTO_DISABLE_RECOVER_MS / MINUTE_MS) + 'm' : 'manual restart'}]` : ''}
 Post Only (Maker): ${GRID_POST_ONLY ? 'ON' : 'OFF'}
 Learning Memory: ${LEARNING_MEMORY_ENABLED ? `ON (penalty-only, halflife=${LEARNING_MEMORY_HALFLIFE_TRADES} trades, maxPenalty=${LEARNING_MEMORY_MAX_PENALTY * 100}pt, circuitBreaker=${LEARNING_MEMORY_CONSECUTIVE_LOSS_LIMIT} losses)` : 'OFF'}
 `);
