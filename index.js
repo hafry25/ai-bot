@@ -1140,7 +1140,18 @@ class SpotGridEngine {
     return symState.trailingDown;
   }
 
-  calculateTrailingShift(currentPrice, lower, upper, direction) {
+  calculateTrailingShift(currentPrice, lower, upper, direction, symbol = null) {
+    if (symbol) {
+      const tickSize = this.getMarketTickSize(symbol);
+      const rawStep = GRID_MODE === 'GEOMETRIC' ? null : (upper - lower) / GRID_COUNT;
+      if (rawStep !== null && tickSize > 0 && rawStep < tickSize) {
+        console.warn(
+          `[TRAILING] ${symbol} skipping ${direction} shift: grid step ${rawStep} is already below ` +
+          `exchange tick size ${tickSize}. Widen the range or lower GRID_COUNT.`
+        );
+        return null;
+      }
+    }
     if (GRID_MODE === 'GEOMETRIC') {
       const ratio = Math.pow(upper / lower, 1 / GRID_COUNT);
       if (!(ratio > 1)) return null;
@@ -1339,7 +1350,7 @@ class SpotGridEngine {
     const trailingState = this.getTrailingUpState(symbol);
     const lastShiftAt = Date.parse(trailingState.lastShiftAt || 0);
     if (GRID_TRAILING_UP_COOLDOWN_MS > Date.now() - lastShiftAt) return null;
-    const shift = this.calculateTrailingShift(currentPrice, lower, upper, 'up');
+    const shift = this.calculateTrailingShift(currentPrice, lower, upper, 'up', symbol);
     if (!shift) return null;
     try {
       return await this.applyTrailingRangeShift(symbol, lower, upper, shift, 'up');
@@ -1354,7 +1365,7 @@ class SpotGridEngine {
     const trailingState = this.getTrailingDownState(symbol);
     const lastShiftAt = Date.parse(trailingState.lastShiftAt || 0);
     if (GRID_TRAILING_DOWN_COOLDOWN_MS > Date.now() - lastShiftAt) return null;
-    const shift = this.calculateTrailingShift(currentPrice, lower, upper, 'down');
+    const shift = this.calculateTrailingShift(currentPrice, lower, upper, 'down', symbol);
     if (!shift) return null;
     try {
       return await this.applyTrailingRangeShift(symbol, lower, upper, shift, 'down');
@@ -1364,20 +1375,60 @@ class SpotGridEngine {
     }
   }
 
-  buildLevels(lower, upper) {
+  buildLevels(lower, upper, symbol = null) {
     if (GRID_COUNT < 2) throw new Error('GRID_COUNT minimal 2.');
+    let levels;
     if (GRID_MODE === 'GEOMETRIC') {
       const ratio = Math.pow(upper / lower, 1 / GRID_COUNT);
-      const levels = Array.from({ length: GRID_COUNT + 1 }, (_, i) => lower * Math.pow(ratio, i));
+      levels = Array.from({ length: GRID_COUNT + 1 }, (_, i) => lower * Math.pow(ratio, i));
       levels[0] = lower;
       levels[GRID_COUNT] = upper;
-      return levels;
+    } else {
+      const step = (upper - lower) / GRID_COUNT;
+      levels = Array.from({ length: GRID_COUNT + 1 }, (_, i) => lower + step * i);
+      levels[0] = lower;
+      levels[GRID_COUNT] = upper;
     }
-    const step = (upper - lower) / GRID_COUNT;
-    const levels = Array.from({ length: GRID_COUNT + 1 }, (_, i) => lower + step * i);
-    levels[0] = lower;
-    levels[GRID_COUNT] = upper;
+    if (symbol) this.assertLevelsAreDistinct(symbol, levels, lower, upper);
     return levels;
+  }
+
+  // Guards against grid levels collapsing onto the same exchange-rounded price.
+  // This can happen when the range becomes too narrow relative to GRID_COUNT —
+  // e.g. after several trailing up/down shifts, or a tight AI-suggested range —
+  // causing the raw step size to fall below the exchange's price tick size.
+  // Two distinct level indexes mapping to the same rounded price would otherwise
+  // cause duplicate orders at an identical price, and would break getLevelIndex's
+  // nearest-level matching (ties silently resolve to the lower index).
+  assertLevelsAreDistinct(symbol, levels, lower, upper) {
+    const tickSize = this.getMarketTickSize(symbol);
+    if (!(tickSize > 0)) return;
+    const rounded = levels.map(level => {
+      try {
+        return Number(this.exchange.priceToPrecision(symbol, level));
+      } catch {
+        return level;
+      }
+    });
+    const seen = new Map();
+    const collisions = [];
+    rounded.forEach((price, index) => {
+      if (seen.has(price)) {
+        collisions.push({ a: seen.get(price), b: index, price });
+      } else {
+        seen.set(price, index);
+      }
+    });
+    if (collisions.length > 0) {
+      const detail = collisions
+        .map(c => `level ${c.a} & ${c.b} -> ${c.price}`)
+        .join(', ');
+      throw new Error(
+        `${symbol} grid range ${roundNumber(lower, 8)}-${roundNumber(upper, 8)} with GRID_COUNT=${GRID_COUNT} ` +
+        `produces overlapping price levels after rounding to exchange tick size ${tickSize} (${detail}). ` +
+        `Widen the range, lower GRID_COUNT, or use GRID_MODE=GEOMETRIC for a wide range on a low-priced asset.`
+      );
+    }
   }
 
   getLevelIndex(levels, price) {
@@ -1405,7 +1456,7 @@ class SpotGridEngine {
     ]);
     const currentPrice = Number(ticker.last);
     const { lower, upper } = await this.buildRange(symbol, currentPrice);
-    const levels = this.buildLevels(lower, upper);
+    const levels = this.buildLevels(lower, upper, symbol);
     return { ticker, currentPrice, openOrders, balance, lower, upper, levels };
   }
 
@@ -1595,6 +1646,22 @@ class SpotGridEngine {
   getMinCost(symbol) {
     const market = this.exchange.markets[symbol];
     return Number(market?.limits?.cost?.min || 0);
+  }
+
+  // Smallest price increment the exchange will accept/round to for this symbol.
+  // Used to detect when grid levels would collapse onto the same price after
+  // rounding (e.g. range too narrow for GRID_COUNT, or after several trailing
+  // shifts / a tight AI-suggested range).
+  getMarketTickSize(symbol) {
+    const market = this.exchange?.markets?.[symbol];
+    const precisionPrice = market?.precision?.price;
+    if (precisionPrice && precisionPrice > 0) {
+      // ccxt may express price precision either as a tick size (e.g. 0.01) or
+      // as a decimal-place count (e.g. 2). Treat values >= 1 as decimal places.
+      return precisionPrice >= 1 ? Math.pow(10, -precisionPrice) : precisionPrice;
+    }
+    const minPriceLimit = Number(market?.limits?.price?.min || 0);
+    return minPriceLimit > 0 ? minPriceLimit : 0.00000001;
   }
 
   getTradeFeeCurrency(trade) {
