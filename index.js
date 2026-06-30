@@ -115,6 +115,10 @@ const GEMINI_RANGE_ADVISOR_USE_WEB_SEARCH = Config.boolean('GEMINI_RANGE_ADVISOR
 // How far the AI-recommended range is allowed to differ from the current
 // auto/manual range before being applied; a safety clamp against bad output.
 const GEMINI_RANGE_ADVISOR_MAX_SHIFT_PCT = Config.number('GEMINI_RANGE_ADVISOR_MAX_SHIFT_PCT', 40);
+// Minimum width (as a % of current price) the AI-recommended range must span.
+// Passed into the prompt as an instruction so Gemini doesn't suggest an overly
+// narrow range that would cause grid levels to bunch up too tightly.
+const GEMINI_RANGE_ADVISOR_MIN_RANGE_WIDTH_PCT = Config.number('GEMINI_RANGE_ADVISOR_MIN_RANGE_WIDTH_PCT', 2);
 const GEMINI_RANGE_ADVISOR_MIN_CONFIDENCE = Config.number('GEMINI_RANGE_ADVISOR_MIN_CONFIDENCE', 0.55);
 const GEMINI_RANGE_ADVISOR_TIMEOUT_MS = Config.number('GEMINI_RANGE_ADVISOR_TIMEOUT_MS', 20_000);
 const GEMINI_RANGE_ADVISOR_APPLY_ON = Config.get('GEMINI_RANGE_ADVISOR_APPLY_ON', 'AUTO_RANGE_ONLY').toUpperCase();
@@ -849,6 +853,8 @@ ${GEMINI_RANGE_ADVISOR_USE_WEB_SEARCH
   : 'Do not use external search; rely only on the indicators provided.'}
 
 Based on all of this, recommend a grid trading price range (lower and upper bound) that is appropriate for the next few hours to a day, and assess whether current conditions favor grid trading (ranging) or disfavor it (strongly trending, about to break out).
+
+Minimum range width requirement: the recommended range MUST span at least ${GEMINI_RANGE_ADVISOR_MIN_RANGE_WIDTH_PCT}% of the current price (i.e. upper - lower >= ${GEMINI_RANGE_ADVISOR_MIN_RANGE_WIDTH_PCT}% * ${currentPrice}). Do not recommend a narrower range even if volatility appears very low; widen the range as needed to meet this minimum.
 
 Respond with ONLY a single valid JSON object, no markdown fences, no commentary, in exactly this shape:
 {
@@ -2298,7 +2304,7 @@ Max Active Orders: buy=${GRID_MAX_ACTIVE_BUY_ORDERS}, sell=${GRID_MAX_ACTIVE_SEL
 Recreate On Start: ${GRID_RECREATE_ON_START ? 'ON' : 'OFF'}
 Post Only (Maker): ${GRID_POST_ONLY ? 'ON' : 'OFF'}
 Smart Range Advisor (Gemini): ${GEMINI_RANGE_ADVISOR_ENABLED
-      ? `ON (model=${GEMINI_MODEL}, min-interval=${GEMINI_RANGE_ADVISOR_MIN_INTERVAL_MS / MINUTE_MS}m, web-search=${GEMINI_RANGE_ADVISOR_USE_WEB_SEARCH ? 'ON' : 'OFF'}, applies-to=${GEMINI_RANGE_ADVISOR_APPLY_ON})`
+      ? `ON (model=${GEMINI_MODEL}, min-interval=${GEMINI_RANGE_ADVISOR_MIN_INTERVAL_MS / MINUTE_MS}m, web-search=${GEMINI_RANGE_ADVISOR_USE_WEB_SEARCH ? 'ON' : 'OFF'}, min-range-width=${GEMINI_RANGE_ADVISOR_MIN_RANGE_WIDTH_PCT}%, applies-to=${GEMINI_RANGE_ADVISOR_APPLY_ON})`
       : 'OFF'}
 `);
     await this.init();
