@@ -1056,6 +1056,11 @@ class SpotGridEngine {
     const manualRange = hasManualGridRange();
     let storedLower = Number(symState.config.lower) || 0;
     let storedUpper = Number(symState.config.upper) || 0;
+    // Captured BEFORE storedLower/storedUpper get zeroed out below, so we
+    // still know what the previous range was if a reset happens.
+    const previousLower = storedLower;
+    const previousUpper = storedUpper;
+    let rangeWasReset = false;
 
     if (!manualRange && storedLower > 0 && storedUpper > 0) {
       const stale = this.isStoredRangeStale(symbol, currentPrice, storedLower, storedUpper);
@@ -1064,6 +1069,7 @@ class SpotGridEngine {
           console.warn(`[RANGE] ${symbol} auto-resetting stale range around current price (GRID_STALE_RANGE_AUTO_RESET=true).`);
           storedLower = 0;
           storedUpper = 0;
+          rangeWasReset = true;
         } else {
           console.warn(
             `[RANGE] ${symbol} keeping stale stored range because GRID_STALE_RANGE_AUTO_RESET=false. ` +
@@ -1077,6 +1083,9 @@ class SpotGridEngine {
     const resetAutoRange = !manualRange &&
       GRID_RESET_RANGE_ON_START &&
       !(this.rangeResetSymbols && this.rangeResetSymbols.has(symbol));
+    if (resetAutoRange && previousLower > 0 && previousUpper > 0) {
+      rangeWasReset = true;
+    }
 
     // Smart Grid Range Advisor: ask Gemini for a recommended range. Only
     // considered when it's allowed to influence this symbol's range mode
@@ -1106,6 +1115,21 @@ class SpotGridEngine {
     if (lower <= 0 || upper <= 0 || lower >= upper) {
       throw new Error(`Invalid grid range. lower=${lower}, upper=${upper}`);
     }
+
+    // Unlike a trailing shift (which is a parallel translation of the same
+    // grid, handled by applyTrailingRangeShift's offset-based remap), a
+    // stale-range auto-reset or GRID_RESET_RANGE_ON_START produces a
+    // brand-new lower/upper with no fixed relationship to the old one. If we
+    // simply swap symState.config without reconciling, any open managed
+    // orders and accumulated lastBuyByLevel records stay indexed against the
+    // OLD grid's level numbering while levels[] is rebuilt from the NEW
+    // range — silently desyncing buy/sell pairing, P&L, and refill prices.
+    // Reconcile BEFORE the new range is persisted.
+    if (rangeWasReset && previousLower > 0 && previousUpper > 0 &&
+        (previousLower !== lower || previousUpper !== upper)) {
+      await this.remapStateAfterRangeReset(symbol, previousLower, previousUpper, lower, upper);
+    }
+
     symState.config = {
       mode: GRID_MODE,
       count: GRID_COUNT,
@@ -1128,6 +1152,101 @@ class SpotGridEngine {
     return { lower, upper };
   }
 
+  /**
+   * Reconciles open grid order metadata and accumulated buy records when the
+   * range is RESET to a brand-new lower/upper (stale-range auto-reset or
+   * GRID_RESET_RANGE_ON_START), as opposed to incrementally TRAILED.
+   *
+   * A trailing shift is a parallel translation of the existing grid, so
+   * applyTrailingRangeShift can safely fix it up with a constant level-index
+   * offset. A reset has no such fixed relationship to the old grid (the new
+   * lower/upper/step can be completely different), so old level indexes are
+   * meaningless against the new grid. Instead we:
+   *   1. Cancel any bot-managed open orders — they were placed at OLD-range
+   *      prices and no longer correspond to any level on the NEW grid. Left
+   *      alone, they'd sit there until GRID_CANCEL_OUT_OF_RANGE eventually
+   *      catches them (if even enabled), with state.orders meanwhile
+   *      pointing at stale level indexes.
+   *   2. Re-map each accumulated buy record (lastBuyByLevel) from its OLD
+   *      level index to whichever NEW level its actual average fill price
+   *      lands closest to, merging records that collapse onto the same new
+   *      level (same weighted-average merge used by applyTrailingRangeShift)
+   *      so a future sell fill still finds the correct cost basis at
+   *      levelIndex - 1 on the NEW grid.
+   */
+  async remapStateAfterRangeReset(symbol, oldLower, oldUpper, newLower, newUpper) {
+    const symState = this.state.getSymbol(symbol);
+
+    const cancelResult = await this.cancelGridOrders(symbol, 'range-reset');
+    if (cancelResult.failed.length > 0) {
+      const failedIds = cancelResult.failed.map(f => f.id).join(', ');
+      // Do NOT abort the remap: some orders may still be live on the
+      // exchange. The next reconcile cycle's getManagedOpenOrders/
+      // GRID_CANCEL_OUT_OF_RANGE will catch anything left behind.
+      console.warn(
+        `[RANGE] ${symbol} range-reset: ${cancelResult.failed.length} cancellation(s) failed ` +
+        `(ids: ${failedIds}). Proceeding with remap; stale orders will be cleaned up in the next cycle.`
+      );
+    }
+    if (Object.keys(symState.orders).length > 0) {
+      console.warn(
+        `[RANGE] ${symbol} had ${Object.keys(symState.orders).length} managed order(s) after cancellation; clearing stale local metadata`
+      );
+      symState.orders = {};
+    }
+
+    const oldEntries = Object.entries(symState.lastBuyByLevel);
+    if (oldEntries.length === 0) {
+      await this.state.save();
+      return;
+    }
+
+    let newLevels;
+    try {
+      newLevels = this.buildLevels(newLower, newUpper, symbol);
+    } catch (err) {
+      // New range can't even produce distinct levels for this symbol/tick
+      // size — there is no sane new level to attribute old buys to. Clear
+      // them rather than keep stale data that would corrupt P&L; buildRange
+      // will throw separately on the next call if the range itself stays
+      // invalid, which surfaces the problem to the operator.
+      console.warn(
+        `[RANGE] ${symbol} could not build levels for new range ${roundNumber(newLower)}-${roundNumber(newUpper)} ` +
+        `during remap (${err.message}); clearing ${oldEntries.length} buy record(s) to avoid stale P&L data.`
+      );
+      symState.lastBuyByLevel = {};
+      await this.state.save();
+      return;
+    }
+
+    const remapped = {};
+    for (const [oldIdx, buy] of oldEntries) {
+      const fillPrice = Number(buy.price) || 0;
+      if (!(fillPrice > 0)) continue;
+      const newIdx = this.getLevelIndex(newLevels, fillPrice);
+      const collapsed = Boolean(remapped[newIdx]);
+      remapped[newIdx] = this.mergeBuyRecords(remapped[newIdx], buy, {
+        aggregatedAcrossLevels: collapsed,
+      });
+      console.warn(
+        `[RANGE] ${symbol} remapped buy record from old level ${oldIdx} (avg price ${roundNumber(fillPrice)}) ` +
+        `to new level ${newIdx} after range reset ${roundNumber(oldLower)}-${roundNumber(oldUpper)} -> ` +
+        `${roundNumber(newLower)}-${roundNumber(newUpper)}`
+      );
+    }
+    symState.lastBuyByLevel = remapped;
+    await this.state.save();
+
+    console.log(
+      `[RANGE] ${symbol} range reset: remapped ${oldEntries.length} buy record(s) onto new grid ` +
+      `${roundNumber(newLower)}-${roundNumber(newUpper)}`
+    );
+    await this.sendAlert(
+      `[GRID RANGE RESET] ${symbol} range changed ${roundNumber(oldLower)}-${roundNumber(oldUpper)} -> ` +
+      `${roundNumber(newLower)}-${roundNumber(newUpper)}; remapped ${oldEntries.length} buy record(s)`
+    );
+  }
+
   getTrailingUpState(symbol) {
     const symState = this.state.getSymbol(symbol);
     if (!symState.trailingUp) symState.trailingUp = { shifts: 0, lastShiftAt: null };
@@ -1141,55 +1260,75 @@ class SpotGridEngine {
   }
 
   calculateTrailingShift(currentPrice, lower, upper, direction, symbol = null) {
-    if (symbol) {
-      const tickSize = this.getMarketTickSize(symbol);
-      const rawStep = GRID_MODE === 'GEOMETRIC' ? null : (upper - lower) / GRID_COUNT;
-      if (rawStep !== null && tickSize > 0 && rawStep < tickSize) {
-        console.warn(
-          `[TRAILING] ${symbol} skipping ${direction} shift: grid step ${rawStep} is already below ` +
-          `exchange tick size ${tickSize}. Widen the range or lower GRID_COUNT.`
-        );
-        return null;
-      }
-    }
+    let shift;
     if (GRID_MODE === 'GEOMETRIC') {
       const ratio = Math.pow(upper / lower, 1 / GRID_COUNT);
       if (!(ratio > 1)) return null;
       if (direction === 'up') {
         if (currentPrice < this.getTrailingUpTrigger(lower, upper)) return null;
         const steps = Math.max(1, Math.floor(Math.log(currentPrice / upper) / Math.log(ratio)));
-        return {
+        shift = {
           steps,
           lower: lower * Math.pow(ratio, steps),
           upper: upper * Math.pow(ratio, steps),
         };
+      } else {
+        if (currentPrice > this.getTrailingDownTrigger(lower, upper)) return null;
+        const steps = Math.max(1, Math.floor(Math.log(lower / currentPrice) / Math.log(ratio)));
+        shift = {
+          steps,
+          lower: lower / Math.pow(ratio, steps),
+          upper: upper / Math.pow(ratio, steps),
+        };
       }
-      if (currentPrice > this.getTrailingDownTrigger(lower, upper)) return null;
-      const steps = Math.max(1, Math.floor(Math.log(lower / currentPrice) / Math.log(ratio)));
-      return {
-        steps,
-        lower: lower / Math.pow(ratio, steps),
-        upper: upper / Math.pow(ratio, steps),
-      };
+    } else {
+      const stepSize = (upper - lower) / GRID_COUNT;
+      if (!(stepSize > 0)) return null;
+      if (direction === 'up') {
+        if (currentPrice < this.getTrailingUpTrigger(lower, upper)) return null;
+        const steps = Math.max(1, Math.floor((currentPrice - upper) / stepSize));
+        shift = {
+          steps,
+          lower: lower + stepSize * steps,
+          upper: upper + stepSize * steps,
+        };
+      } else {
+        if (currentPrice > this.getTrailingDownTrigger(lower, upper)) return null;
+        const steps = Math.max(1, Math.floor((lower - currentPrice) / stepSize));
+        shift = {
+          steps,
+          lower: lower - stepSize * steps,
+          upper: upper - stepSize * steps,
+        };
+      }
     }
-    const stepSize = (upper - lower) / GRID_COUNT;
-    if (!(stepSize > 0)) return null;
-    if (direction === 'up') {
-      if (currentPrice < this.getTrailingUpTrigger(lower, upper)) return null;
-      const steps = Math.max(1, Math.floor((currentPrice - upper) / stepSize));
-      return {
-        steps,
-        lower: lower + stepSize * steps,
-        upper: upper + stepSize * steps,
-      };
+    if (!shift) return null;
+    if (symbol && !this.shiftLevelsAreUsable(symbol, shift, direction)) return null;
+    return shift;
+  }
+
+  // Validates that the range resulting from a trailing shift would still
+  // produce distinct grid price levels once rounded to the exchange's tick
+  // size, for BOTH grid modes. Previously this guard used a raw-step
+  // comparison that only ran for ARITHMETIC mode (rawStep was forced to null
+  // for GEOMETRIC), so a GEOMETRIC grid could trail into a collapsed range
+  // undetected here and only surface later as an uncaught error thrown by
+  // buildLevels()/assertLevelsAreDistinct() during the next reconcile cycle.
+  // Reusing buildLevels()/assertLevelsAreDistinct() directly (instead of a
+  // hand-rolled step/tick-size comparison) also makes the check exact: it
+  // mirrors precisely what will happen when the new range is actually used.
+  shiftLevelsAreUsable(symbol, shift, direction) {
+    try {
+      this.buildLevels(shift.lower, shift.upper, symbol);
+      return true;
+    } catch (err) {
+      console.warn(
+        `[TRAILING] ${symbol} skipping ${direction} shift: resulting range ` +
+        `${roundNumber(shift.lower)}-${roundNumber(shift.upper)} would produce overlapping grid levels ` +
+        `after rounding to exchange tick size (${err.message}). Widen the range or lower GRID_COUNT.`
+      );
+      return false;
     }
-    if (currentPrice > this.getTrailingDownTrigger(lower, upper)) return null;
-    const steps = Math.max(1, Math.floor((lower - currentPrice) / stepSize));
-    return {
-      steps,
-      lower: lower - stepSize * steps,
-      upper: upper - stepSize * steps,
-    };
   }
 
   getTrailingUpTrigger(lower, upper) {
