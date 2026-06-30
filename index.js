@@ -9,9 +9,6 @@ const { GoogleGenerativeAI } = require('@google/generative-ai');
 const TRUE_VALUES = new Set(['true', '1', 'yes', 'on']);
 const FALSE_VALUES = new Set(['false', '0', 'no', 'off']);
 
-// ------------------------------
-//  Configuration Manager
-// ------------------------------
 class Config {
   static get(key, fallback) {
     const value = process.env[key];
@@ -44,9 +41,6 @@ class Config {
   }
 }
 
-// ------------------------------
-//  Constants
-// ------------------------------
 const SYMBOLS = Config.list('SYMBOLS', 'BTC/USDT');
 const EXCHANGE_MODE = (() => {
   const mode = Config.get('EXCHANGE_MODE', Config.boolean('EXCHANGE_DEMO', false) ? 'testnet' : 'live').toLowerCase();
@@ -106,10 +100,6 @@ const AI_VALIDATION_TIMEOUT_MS = Math.max(Config.number('AI_VALIDATION_TIMEOUT_M
 const AI_MIN_CONFIDENCE = Config.number('AI_MIN_CONFIDENCE', 70);
 const GEMINI_MODEL = Config.get('GEMINI_MODEL', 'gemini-2.0-flash-lite');
 
-// Auto-disable AI validation on repeated errors (rate limit, quota exceeded, etc.)
-// AI_VALIDATION_AUTO_DISABLE=true  → auto off saat error terdeteksi
-// AI_VALIDATION_AUTO_DISABLE_THRESHOLD → jumlah error berturut-turut sebelum di-off
-// AI_VALIDATION_AUTO_DISABLE_RECOVER_MS → berapa lama sebelum coba re-enable (0 = permanen off)
 const AI_VALIDATION_AUTO_DISABLE = Config.boolean('AI_VALIDATION_AUTO_DISABLE', true);
 const AI_VALIDATION_AUTO_DISABLE_THRESHOLD = Config.number('AI_VALIDATION_AUTO_DISABLE_THRESHOLD', 3);
 const AI_VALIDATION_AUTO_DISABLE_RECOVER_MS = Config.number('AI_VALIDATION_AUTO_DISABLE_RECOVER_MS', 60 * MINUTE_MS);
@@ -128,20 +118,14 @@ const FONNTE_API_URL = Config.get('FONNTE_API_URL', 'https://api.fonnte.com/send
 const FONNTE_COUNTRY_CODE = Config.get('FONNTE_COUNTRY_CODE', '62');
 const FONNTE_TIMEOUT_MS = Config.number('FONNTE_TIMEOUT_MS', 10_000);
 
-// ---- Learning Memory Configuration ----
 const LEARNING_MEMORY_ENABLED = Config.boolean('LEARNING_MEMORY_ENABLED', false);
 const LEARNING_MEMORY_FILE = Config.get('LEARNING_MEMORY_FILE', 'learning-memory.json');
 const LEARNING_MEMORY_PATH = path.resolve(process.cwd(), LEARNING_MEMORY_FILE);
 const LEARNING_MEMORY_LOOKBACK = Config.number('LEARNING_MEMORY_LOOKBACK', 20);
 const LEARNING_MEMORY_MIN_SAMPLES = Config.number('LEARNING_MEMORY_MIN_SAMPLES', 5);
-// Max penalty Learning Memory can apply to AI confidence (downward only)
-// e.g. 0.3 means confidence can be reduced by at most 30 percentage points
 const LEARNING_MEMORY_MAX_PENALTY = Config.number('LEARNING_MEMORY_MAX_PENALTY', 0.3);
-// Consecutive losses threshold to trigger immediate circuit-breaker block
 const LEARNING_MEMORY_CONSECUTIVE_LOSS_LIMIT = Config.number('LEARNING_MEMORY_CONSECUTIVE_LOSS_LIMIT', 5);
-// Half-life in number of trades for time-weighting (older trades decay exponentially)
 const LEARNING_MEMORY_HALFLIFE_TRADES = Config.number('LEARNING_MEMORY_HALFLIFE_TRADES', 10);
-// ---------------------------------------------------
 
 const MAX_PROCESSED_TRADE_IDS = 2000;
 const TRADE_FETCH_LIMIT = 100;
@@ -163,7 +147,6 @@ class AtomicFileWriter {
           await fs.promises.writeFile(tempPath, buildContents());
           await fs.promises.rename(tempPath, filePath);
         } catch (err) {
-          // Best-effort cleanup of the orphaned temp file so it doesn't accumulate.
           fs.promises.unlink(tempPath).catch(() => {});
           throw err;
         }
@@ -210,9 +193,6 @@ class AtomicFileWriter {
   }
 }
 
-// ------------------------------
-//  Utility Functions
-// ------------------------------
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 
 function sleepSync(ms) {
@@ -368,9 +348,6 @@ function validateRuntimeConfiguration() {
   }
 }
 
-// ------------------------------
-//  Single Process Lock
-// ------------------------------
 class ProcessLock {
   constructor(lockPath) {
     this.lockPath = lockPath;
@@ -516,13 +493,8 @@ class ProcessLock {
 
   release() {
     if (this.fd === null) return;
-    // Capture and clear the token BEFORE closing fd so ownsLock() can't be
-    // called after the file descriptor is invalid.  We verify ownership using
-    // the in-memory token directly rather than re-reading the lock file after
-    // closeSync(), which would introduce a TOCTOU race.
     const tokenSnapshot = this.ownerToken;
     try {
-      // Check ownership while fd is still open (file content is stable).
       const isOwner = tokenSnapshot !== null && this.ownsLock();
       fs.closeSync(this.fd);
       if (isOwner) {
@@ -544,9 +516,6 @@ class ProcessLock {
   }
 }
 
-// ------------------------------
-//  Exchange Singleton
-// ------------------------------
 class ExchangeManager {
   static instance = null;
 
@@ -574,9 +543,6 @@ class ExchangeManager {
   }
 }
 
-// ------------------------------
-//  Persistent Grid State
-// ------------------------------
 class GridState {
   constructor() {
     this.data = this.load();
@@ -693,38 +659,20 @@ class GridState {
   }
 }
 
-// ------------------------------
-//  Learning Memory (improved)
-// ------------------------------
-//
-// Design principles vs original:
-//  1. PENALTY-ONLY  — memory can only reduce AI confidence, never inflate it.
-//     This prevents false confidence when the market regime changes.
-//  2. TIME-WEIGHTED — recent trades have exponentially more weight than old ones
-//     (half-life = LEARNING_MEMORY_HALFLIFE_TRADES).
-//  3. CONSECUTIVE-LOSS CIRCUIT BREAKER — if the last N trades are all losses,
-//     trading is blocked immediately regardless of AI confidence.
-//  4. TRANSPARENT LOGGING — every adjustment is logged with full diagnostics.
-// ------------------------------
 class LearningMemory {
   constructor() {
     this.filePath = LEARNING_MEMORY_PATH;
     this.enabled = LEARNING_MEMORY_ENABLED;
     this.windowSize = LEARNING_MEMORY_LOOKBACK;
     this.minSamples = LEARNING_MEMORY_MIN_SAMPLES;
-    this.maxPenalty = LEARNING_MEMORY_MAX_PENALTY;           // max confidence reduction (fraction)
+    this.maxPenalty = LEARNING_MEMORY_MAX_PENALTY;
     this.consecutiveLossLimit = LEARNING_MEMORY_CONSECUTIVE_LOSS_LIMIT;
     this.halflifeTrades = Math.max(LEARNING_MEMORY_HALFLIFE_TRADES, 1);
-    // symbol -> { entries: [{profit, timestamp}], totalProfit, count }
     this.data = {};
     if (this.enabled) this.load();
   }
 
   isEnabled() { return this.enabled === true; }
-
-  // ------------------------------------------------------------------
-  //  Persistence
-  // ------------------------------------------------------------------
 
   load() {
     try {
@@ -733,7 +681,6 @@ class LearningMemory {
         const parsed = JSON.parse(raw);
         if (isPlainObject(parsed)) {
           for (const [symbol, record] of Object.entries(parsed)) {
-            // Support both new format (entries[]) and legacy format (profits[])
             if (Array.isArray(record.entries)) {
               this.data[symbol] = {
                 entries: record.entries
@@ -743,7 +690,6 @@ class LearningMemory {
                 count: Number(record.count) || 0,
               };
             } else if (Array.isArray(record.profits)) {
-              // Migrate legacy format — assign synthetic timestamps spaced 1 minute apart
               const now = Date.now();
               this.data[symbol] = {
                 entries: record.profits
@@ -781,10 +727,6 @@ class LearningMemory {
     AtomicFileWriter.write(this.filePath, () => `${JSON.stringify(toWrite, null, 2)}\n`);
   }
 
-  // ------------------------------------------------------------------
-  //  Recording
-  // ------------------------------------------------------------------
-
   async recordProfit(symbol, profit) {
     if (!this.isEnabled()) return;
     if (!this.data[symbol]) {
@@ -792,7 +734,6 @@ class LearningMemory {
     }
     const record = this.data[symbol];
     record.entries.push({ profit, ts: Date.now() });
-    // Keep bounded storage: retain last 2*windowSize entries
     if (record.entries.length > this.windowSize * 2) {
       record.entries = record.entries.slice(-this.windowSize * 2);
     }
@@ -804,10 +745,6 @@ class LearningMemory {
     );
     await this.save();
   }
-
-  // ------------------------------------------------------------------
-  //  Core Analytics
-  // ------------------------------------------------------------------
 
   /**
    * Exponential decay weight for the i-th entry (0 = oldest in window).
@@ -833,7 +770,6 @@ class LearningMemory {
     const n = recent.length;
     if (n < this.minSamples) return neutral;
 
-    // ---- 1. Consecutive loss circuit breaker (unweighted, most recent N) ----
     let consecutiveLosses = 0;
     for (let i = n - 1; i >= 0; i--) {
       if (recent[i].profit <= 0) consecutiveLosses++;
@@ -850,7 +786,6 @@ class LearningMemory {
       };
     }
 
-    // ---- 2. Time-weighted win rate & avg profit ----
     let weightSum = 0;
     let winWeightSum = 0;
     let profitWeightSum = 0;
@@ -867,16 +802,12 @@ class LearningMemory {
     const weightedAvgProfit = weightSum > 0 ? profitWeightSum / weightSum : 0;
     const relProfit = orderSize > 0 ? weightedAvgProfit / orderSize : 0;
 
-    // ---- 3. Compute penalty (0 = fine, maxPenalty = worst) ----
-    // Only penalise — never reward — Learning Memory.
     let penalty = 0;
 
-    // Win rate below 40% → scale penalty up to maxPenalty/2
     if (weightedWinRate < 0.4) {
       penalty += (this.maxPenalty / 2) * ((0.4 - weightedWinRate) / 0.4);
     }
 
-    // Negative relative profit → scale additional penalty up to maxPenalty/2
     if (relProfit < -0.01) {
       penalty += (this.maxPenalty / 2) * Math.min((-relProfit) / 0.1, 1.0);
     }
@@ -890,10 +821,6 @@ class LearningMemory {
     return { penalty, reason, consecutiveLosses, weightedWinRate, weightedAvgProfit };
   }
 
-  // ------------------------------------------------------------------
-  //  Public API — called from AIGridValidator
-  // ------------------------------------------------------------------
-
   /**
    * Applies a penalty-only adjustment to `decision` (mutates in place).
    * Returns the (possibly modified) decision for chaining.
@@ -904,11 +831,9 @@ class LearningMemory {
     const { penalty, reason, consecutiveLosses } = this.analyze(symbol);
 
     if (penalty <= 0 && consecutiveLosses < this.consecutiveLossLimit) {
-      return decision; // nothing to do
+      return decision;
     }
 
-    // Hard-block immediately when consecutive-loss circuit breaker fires,
-    // regardless of how high the AI confidence is.
     if (consecutiveLosses >= this.consecutiveLossLimit) {
       const blockReason = `Memory[${symbol}]: circuit-breaker triggered — ${consecutiveLosses} consecutive losses (limit=${this.consecutiveLossLimit})`;
       decision.allowTrading = false;
@@ -923,7 +848,7 @@ class LearningMemory {
     }
 
     const oldConf = decision.confidence;
-    const penaltyPoints = penalty * 100; // convert fraction → percentage points
+    const penaltyPoints = penalty * 100;
     decision.confidence = Math.max(0, decision.confidence - penaltyPoints);
 
     const memoryNote = reason
@@ -946,19 +871,15 @@ class LearningMemory {
   }
 }
 
-// ------------------------------
-//  Gemini Grid Validation
-// ------------------------------
 class AIGridValidator {
   static cache = new Map();
   static MAX_CACHE_SIZE = 100;
   static lastDecisionBySymbol = new Map();
   static rateLimitedUntil = 0;
 
-  // --- Auto-disable state ---
-  static autoDisabledAt = 0;         // timestamp saat AI di-disable otomatis (0 = aktif)
-  static autoDisableUntil = 0;       // timestamp kapan boleh recover (0 = belum di-disable)
-  static consecutiveErrors = 0;      // jumlah error berturut-turut sejak sukses terakhir
+  static autoDisabledAt = 0;
+  static autoDisableUntil = 0;
+  static consecutiveErrors = 0;
 
   constructor(exchange) {
     this.exchange = exchange;
@@ -1077,11 +998,9 @@ class AIGridValidator {
       message.includes('resource_exhausted');
   }
 
-  // Returns true jika error ini termasuk kategori yang memicu auto-disable
   isAutoDisableError(err) {
     if (this.isRateLimitError(err)) return true;
     const message = String(err?.message || err || '').toLowerCase();
-    // Quota exceeded, billing, API key invalid, service unavailable
     return (
       message.includes('quota') ||
       message.includes('exceeded') ||
@@ -1098,7 +1017,6 @@ class AIGridValidator {
     );
   }
 
-  // Tandai satu error berturut-turut; auto-disable jika threshold tercapai
   recordAiError(err) {
     if (!AI_VALIDATION_AUTO_DISABLE) return;
     AIGridValidator.consecutiveErrors++;
@@ -1122,14 +1040,12 @@ class AIGridValidator {
     }
   }
 
-  // Reset counter setelah sukses
   recordAiSuccess() {
     if (AIGridValidator.consecutiveErrors > 0) {
       console.log(`[AI] AI validation sukses — reset consecutive error counter (was ${AIGridValidator.consecutiveErrors})`);
     }
     AIGridValidator.consecutiveErrors = 0;
 
-    // Jika sebelumnya auto-disabled tapi sudah lewat recover window, re-enable
     if (AIGridValidator.autoDisableUntil > 0 && AIGridValidator.autoDisableUntil !== Infinity) {
       if (Date.now() >= AIGridValidator.autoDisableUntil) {
         AIGridValidator.autoDisableUntil = 0;
@@ -1139,13 +1055,11 @@ class AIGridValidator {
     }
   }
 
-  // Cek apakah AI validation sedang dalam kondisi auto-disabled
   isAutoDisabled() {
     if (!AI_VALIDATION_AUTO_DISABLE) return false;
     if (AIGridValidator.autoDisableUntil === 0) return false;
-    if (AIGridValidator.autoDisableUntil === Infinity) return true; // permanen sampai restart
+    if (AIGridValidator.autoDisableUntil === Infinity) return true;
     if (Date.now() < AIGridValidator.autoDisableUntil) return true;
-    // Sudah lewat recover window → re-enable otomatis
     console.log('[AI] AI validation recover window selesai — re-enabling AI validation.');
     AIGridValidator.autoDisableUntil = 0;
     AIGridValidator.autoDisabledAt = 0;
@@ -1262,7 +1176,6 @@ Be conservative. Protect capital first.
       return decision;
     }
 
-    // --- Auto-disable check ---
     if (this.isAutoDisabled()) {
       const disabledSec = Math.round((Date.now() - AIGridValidator.autoDisabledAt) / 1000);
       const recoverInfo = AIGridValidator.autoDisableUntil === Infinity
@@ -1323,29 +1236,27 @@ Be conservative. Protect capital first.
             this.setCached(cacheKey, decision);
             this.rememberDecision(symbol, decision);
           }
-          this.recordAiSuccess(); // reset error counter setelah sukses
+          this.recordAiSuccess();
           break;
         } catch (err) {
           if (this.isRateLimitError(err)) {
             AIGridValidator.rateLimitedUntil = Date.now() + AI_VALIDATION_BACKOFF_MS;
-            this.recordAiError(err); // catat untuk auto-disable
+            this.recordAiError(err);
             const stale = this.getLastDecision(symbol, true);
             if (stale) return stale;
             throw err;
           }
           if (attempt > AI_VALIDATION_RETRIES) {
-            this.recordAiError(err); // catat error final setelah semua retry habis
+            this.recordAiError(err);
             throw err;
           }
           await sleep(1000 * attempt);
         }
       }
 
-      // ---- Learning Memory Integration (penalty-only, with circuit breaker) ----
       if (this.learningMemory && decision) {
         this.learningMemory.applyTo(symbol, decision);
 
-        // Re-apply confidence rules after memory penalty
         this.applyConfidenceRules(decision);
         if (decision.confidence < AI_MIN_CONFIDENCE) {
           decision = AIGridValidator.block(
@@ -1356,7 +1267,6 @@ Be conservative. Protect capital first.
         this.setCached(cacheKey, decision);
         this.rememberDecision(symbol, decision);
       }
-      // -----------------------------------------------------------------------
 
       return decision;
     } catch (err) {
@@ -1367,17 +1277,12 @@ Be conservative. Protect capital first.
       if (isRateLimit) {
         AIGridValidator.rateLimitedUntil = Date.now() + AI_VALIDATION_BACKOFF_MS;
       }
-      // recordAiError sudah dipanggil di inner loop saat retry habis/rate limit
-      // Tapi jika error di luar loop (misal fetchOHLCV), catat di sini
       if (!isRateLimit) this.recordAiError(err);
       return this.blockAndRemember(symbol, cacheKey, reason);
     }
   }
 }
 
-// ------------------------------
-//  Binance-Style Spot Grid Engine
-// ------------------------------
 class SpotGridEngine {
   constructor() {
     this.exchange = ExchangeManager.getInstance();
@@ -1388,7 +1293,6 @@ class SpotGridEngine {
     this.pendingOrderLevels = new Set();
     this.rangeResetSymbols = new Set();
     this.circuitBreaker = { errors: 0, pausedUntil: 0 };
-    // for stuck investment warning deduplication
     this.stuckInvestmentWarned = new Set();
   }
 
@@ -1662,11 +1566,6 @@ class SpotGridEngine {
     const cancelResult = await this.cancelGridOrders(symbol, `trailing-${direction}`);
     if (cancelResult.failed.length > 0) {
       const failedIds = cancelResult.failed.map(f => f.id).join(', ');
-      // Do NOT abort the shift: some orders may still be live on the exchange.
-      // Log clearly and continue – the next reconcile cycle will detect those
-      // orders via getManagedOpenOrders (they'll be in state.orders or carry a
-      // parseable clientOrderId) and either cancel them (GRID_CANCEL_OUT_OF_RANGE)
-      // or adopt them at the new grid level.
       console.warn(
         `[TRAILING] ${symbol} trailing-${direction} shift: ${cancelResult.failed.length} cancellation(s) failed ` +
         `(ids: ${failedIds}). Proceeding with shift; stale orders will be cleaned up in the next cycle.`
@@ -1996,9 +1895,6 @@ class SpotGridEngine {
     if (!feeCurrency || feeCost === 0) return 0;
     if (feeCurrency === quoteAsset) return feeCost;
     if (feeCurrency === baseAsset) return feeCost * price;
-    // Third-party fee token (e.g. BNB).  We cannot convert synchronously
-    // without a live price – use the cached rate if available, otherwise 0.
-    // Call cacheFeeTokenPrice() asynchronously to keep rates fresh.
     const cachedRate = this.feeTokenRates?.get(feeCurrency);
     if (cachedRate > 0) {
       return feeCost * cachedRate;
@@ -2162,11 +2058,9 @@ class SpotGridEngine {
     const allocatedBuyFee = buy.totalFeeQuote * proportion;
     const profit = (proceedsQuote - feeQuote) - (allocatedBuyCost + allocatedBuyFee);
 
-    // ---- Record profit for learning memory ----
     if (this.aiValidator.learningMemory) {
       await this.aiValidator.learningMemory.recordProfit(symbol, profit);
     }
-    // -------------------------------------------
 
     symState.realizedGridProfit += profit;
     this.state.data.totals.realizedGridProfit += profit;
@@ -2250,19 +2144,11 @@ class SpotGridEngine {
       const lastTimestamp = trades[trades.length - 1].timestamp;
       if (trades.length < TRADE_FETCH_LIMIT) break;
       if (lastTimestamp === from) {
-        // A full page of trades all share the same millisecond timestamp.
-        // We cannot safely advance `from` to lastTimestamp+1 because there
-        // may be MORE trades at this exact timestamp on the next page that
-        // the exchange hasn't returned yet.  Stop here and do NOT advance
-        // lastTradeTimestamp — the next cycle will re-fetch from this same
-        // timestamp.  processedTrade() deduplication ensures already-seen
-        // fills are skipped without re-processing.
         console.warn(
           `[TRADES] ${symbol} pagination stopped: full page (${TRADE_FETCH_LIMIT}) of trades share ` +
           `timestamp ${lastTimestamp}. Holding lastTradeTimestamp at ${from} so unseen fills ` +
           `in this timestamp bucket are picked up on the next cycle.`
         );
-        // Return what we have but DO NOT update lastTradeTimestamp.
         return allTrades;
       }
       from = lastTimestamp + 1;
@@ -2281,10 +2167,6 @@ class SpotGridEngine {
     const symState = this.state.getSymbol(symbol);
     const quoteAsset = this.getQuoteAsset(symbol);
 
-    // Pre-warm the fee-token rate cache so feeToQuote() can convert third-party
-    // fees (e.g. BNB) for any fills encountered in this cycle.
-    // BNB is the only Binance platform token used for fee discounts, but we
-    // also refresh any previously seen unknown token for this symbol.
     const knownFeeTokens = new Set(['BNB']);
     if (this.feeTokenRates) {
       for (const token of this.feeTokenRates.keys()) knownFeeTokens.add(token);
@@ -2295,7 +2177,6 @@ class SpotGridEngine {
         .map(t => this.cacheFeeTokenPrice(t, quoteAsset))
     );
 
-    // Reuse caller-supplied openOrders when available to avoid an extra round-trip.
     const [trades, openOrders] = await Promise.all([
       this.fetchNewTrades(symbol, symState),
       preloadedOpenOrders
@@ -2307,11 +2188,8 @@ class SpotGridEngine {
       const id = this.getTradeId(trade);
       if (this.state.processedTrade(symbol, id)) continue;
 
-      // Attempt to get order metadata from state, falling back to clientOrderId
-      // embedded in the trade so fills are never lost across restarts.
       let orderMeta = symState.orders[String(trade.order)];
       if (!orderMeta) {
-        // clientOrderId format: grid-<market>-<s|b>-<levelIndex>-<nonce>
         const clientId = String(
           trade.info?.clientOrderId ||
           trade.info?.origClientOrderId ||
@@ -2328,8 +2206,6 @@ class SpotGridEngine {
             `from clientOrderId="${clientId}" (level=${levelIndex}, side=${side})`
           );
         } else {
-          // Cannot determine which grid level this fill belongs to; skip it
-          // but mark as processed so we don't retry on every cycle.
           console.warn(
             `[SKIP] ${symbol} trade ${id}: order ${trade.order} not in state and ` +
             `no parseable clientOrderId – fill cannot be attributed to a grid level`
@@ -2428,11 +2304,6 @@ class SpotGridEngine {
       );
     }
 
-    // Always reconcile fills that already happened on the exchange, even while trading
-    // is halted by stop-loss/take-profit, so profit, sellable amount, and lastBuyByLevel
-    // never go unrecorded.
-    // Fetch openOrders once here and pass it into handleFilledTrades so we avoid a
-    // redundant exchange round-trip (handleFilledTrades previously fetched its own copy).
     let freshOpenOrders = await retry(() => this.exchange.fetchOpenOrders(symbol));
     await this.handleFilledTrades(symbol, levels, aiDecision, freshOpenOrders);
 
@@ -2441,10 +2312,6 @@ class SpotGridEngine {
       return;
     }
 
-    // The learning memory profit outcomes are updated immediately via recordProfit in handleSellFill,
-    // so no extra updateOutcomes call needed.
-
-    // Re-read balances and open orders after fill handling so placement loops use fresh state.
     balance = await retry(() => this.exchange.fetchBalance());
     freshOpenOrders = await retry(() => this.exchange.fetchOpenOrders(symbol));
     let managedOrders = await this.getManagedOpenOrders(symbol, freshOpenOrders);
@@ -2568,20 +2435,15 @@ class SpotGridEngine {
     const symState = this.state.getSymbol(symbol);
     let allocated = 0;
 
-    // Sum cost of all filled buys tracked in lastBuyByLevel.
     const filledLevels = new Set();
     for (const [levelIndex, buy] of Object.entries(symState.lastBuyByLevel)) {
       allocated += Number(buy.totalCostQuote) || 0;
       filledLevels.add(Number(levelIndex));
     }
 
-    // Sum cost of open (pending) buy orders, but ONLY for levels that do NOT
-    // already have a filled buy record in lastBuyByLevel.  An order that has
-    // been filled but whose state entry hasn't been cleaned up yet would
-    // otherwise be double-counted against the investment cap.
     for (const order of Object.values(symState.orders)) {
       if (String(order.side).toLowerCase() !== 'buy') continue;
-      if (filledLevels.has(Number(order.levelIndex))) continue; // already counted via lastBuyByLevel
+      if (filledLevels.has(Number(order.levelIndex))) continue;
       allocated += (Number(order.amount) || 0) * (Number(order.price) || 0);
     }
 
@@ -2730,8 +2592,6 @@ Learning Memory: ${LEARNING_MEMORY_ENABLED ? `ON (penalty-only, halflife=${LEARN
 async function bootstrap() {
   validateRuntimeConfiguration();
 
-  // Remove any *.tmp files left behind by a previous crashed process before
-  // acquiring the lock so they don't interfere with new atomic writes.
   await AtomicFileWriter.cleanupStaleTempFiles(GRID_STATE_PATH);
   await AtomicFileWriter.cleanupStaleTempFiles(LEARNING_MEMORY_PATH);
 
