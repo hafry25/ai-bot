@@ -103,13 +103,71 @@ const GEMINI_API_BASE_URL = Config.get(
   'GEMINI_API_BASE_URL',
   'https://generativelanguage.googleapis.com'
 );
+const GEMINI_RANGE_ADVISOR_TIMEFRAME = Config.get('GEMINI_RANGE_ADVISOR_TIMEFRAME', '1h');
+
+// Converts a ccxt-style timeframe string (e.g. '1m', '15m', '1h', '4h', '1d')
+// into milliseconds. Prefers ccxt's own parser (so it stays consistent with
+// however the exchange defines each unit) and falls back to a manual regex
+// parser, then to 60 minutes, if that's unavailable or the string is invalid.
+function timeframeToMs(timeframe) {
+  const fallbackMs = 60 * MINUTE_MS;
+  if (typeof timeframe !== 'string' || !timeframe.trim()) return fallbackMs;
+  if (ccxt?.Exchange?.parseTimeframe) {
+    try {
+      const seconds = ccxt.Exchange.parseTimeframe(timeframe);
+      if (Number.isFinite(seconds) && seconds > 0) return seconds * 1000;
+    } catch (err) {
+      // fall through to manual parsing below
+    }
+  }
+  const match = /^(\d+)([mhdwM])$/.exec(timeframe.trim());
+  if (!match) {
+    console.warn(
+      `[CONFIG] Could not parse GEMINI_RANGE_ADVISOR_TIMEFRAME "${timeframe}"; defaulting interval sync to 60m.`
+    );
+    return fallbackMs;
+  }
+  const amount = Number(match[1]);
+  const unitMs = {
+    m: MINUTE_MS,
+    h: 60 * MINUTE_MS,
+    d: 24 * 60 * MINUTE_MS,
+    w: 7 * 24 * 60 * MINUTE_MS,
+    M: 30 * 24 * 60 * MINUTE_MS,
+  }[match[2]];
+  return amount * unitMs;
+}
+
+const GEMINI_RANGE_ADVISOR_TIMEFRAME_MS = timeframeToMs(GEMINI_RANGE_ADVISOR_TIMEFRAME);
+const GEMINI_RANGE_ADVISOR_TIMEFRAME_MINUTES = GEMINI_RANGE_ADVISOR_TIMEFRAME_MS / MINUTE_MS;
+
 // Minimum gap between actual Gemini calls per symbol, even though the advisor is
 // evaluated every cycle. Protects API quota/cost when INTERVAL_MINUTES is small.
+// Defaults to (and is floored at) GEMINI_RANGE_ADVISOR_TIMEFRAME's own duration:
+// a new candle for that timeframe only closes once per that period, so calling
+// Gemini more often just re-analyzes the same OHLCV data and burns API quota
+// for no new information. If the user explicitly sets a smaller value than the
+// timeframe, it is clamped up to the timeframe duration (with a warning).
+const GEMINI_RANGE_ADVISOR_MIN_INTERVAL_MINUTES_RAW = Config.number(
+  'GEMINI_RANGE_ADVISOR_MIN_INTERVAL_MINUTES',
+  GEMINI_RANGE_ADVISOR_TIMEFRAME_MINUTES
+);
+if (
+  Config.get('GEMINI_RANGE_ADVISOR_MIN_INTERVAL_MINUTES', '') !== '' &&
+  GEMINI_RANGE_ADVISOR_MIN_INTERVAL_MINUTES_RAW < GEMINI_RANGE_ADVISOR_TIMEFRAME_MINUTES
+) {
+  console.warn(
+    `[CONFIG] GEMINI_RANGE_ADVISOR_MIN_INTERVAL_MINUTES=${GEMINI_RANGE_ADVISOR_MIN_INTERVAL_MINUTES_RAW} is shorter than ` +
+    `GEMINI_RANGE_ADVISOR_TIMEFRAME "${GEMINI_RANGE_ADVISOR_TIMEFRAME}" (${GEMINI_RANGE_ADVISOR_TIMEFRAME_MINUTES}m). ` +
+    `A new candle only closes once per timeframe, so calling Gemini more often re-analyzes the same candle data. ` +
+    `Clamping the effective interval up to ${GEMINI_RANGE_ADVISOR_TIMEFRAME_MINUTES}m.`
+  );
+}
 const GEMINI_RANGE_ADVISOR_MIN_INTERVAL_MS = Math.max(
-  Config.number('GEMINI_RANGE_ADVISOR_MIN_INTERVAL_MINUTES', 15),
+  GEMINI_RANGE_ADVISOR_MIN_INTERVAL_MINUTES_RAW,
+  GEMINI_RANGE_ADVISOR_TIMEFRAME_MINUTES,
   0
 ) * MINUTE_MS;
-const GEMINI_RANGE_ADVISOR_TIMEFRAME = Config.get('GEMINI_RANGE_ADVISOR_TIMEFRAME', '1h');
 const GEMINI_RANGE_ADVISOR_CANDLE_LIMIT = Config.number('GEMINI_RANGE_ADVISOR_CANDLE_LIMIT', 100);
 const GEMINI_RANGE_ADVISOR_USE_WEB_SEARCH = Config.boolean('GEMINI_RANGE_ADVISOR_USE_WEB_SEARCH', true);
 // How far the AI-recommended range is allowed to differ from the current
@@ -2538,7 +2596,7 @@ Max Active Orders: buy=${GRID_MAX_ACTIVE_BUY_ORDERS}, sell=${GRID_MAX_ACTIVE_SEL
 Recreate On Start: ${GRID_RECREATE_ON_START ? 'ON' : 'OFF'}
 Post Only (Maker): ${GRID_POST_ONLY ? 'ON' : 'OFF'}
 Smart Range Advisor (Gemini): ${GEMINI_RANGE_ADVISOR_ENABLED
-      ? `ON (model=${GEMINI_MODEL}, min-interval=${GEMINI_RANGE_ADVISOR_MIN_INTERVAL_MS / MINUTE_MS}m, web-search=${GEMINI_RANGE_ADVISOR_USE_WEB_SEARCH ? 'ON' : 'OFF'}, min-range-width=${GEMINI_RANGE_ADVISOR_MIN_RANGE_WIDTH_PCT}%, applies-to=${GEMINI_RANGE_ADVISOR_APPLY_ON})`
+      ? `ON (model=${GEMINI_MODEL}, timeframe=${GEMINI_RANGE_ADVISOR_TIMEFRAME}, min-interval=${GEMINI_RANGE_ADVISOR_MIN_INTERVAL_MS / MINUTE_MS}m, web-search=${GEMINI_RANGE_ADVISOR_USE_WEB_SEARCH ? 'ON' : 'OFF'}, min-range-width=${GEMINI_RANGE_ADVISOR_MIN_RANGE_WIDTH_PCT}%, applies-to=${GEMINI_RANGE_ADVISOR_APPLY_ON})`
       : 'OFF'}
 `);
     await this.init();
